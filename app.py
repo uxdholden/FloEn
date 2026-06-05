@@ -25,24 +25,55 @@ if "reminders" not in st.session_state:
 
 def parse_interval_csv(uploaded_file):
     raw = uploaded_file.read().decode("utf-8", errors="ignore")
-    pattern = re.compile(r"(\d{11})(\d+\.\d{3})Active Import Interval kW(\d{2}-\d{2}-\d{4})\s+(\d{4})")
+    pattern = re.compile(
+        r"(?P<mprn>\d{11})\s*"
+        r"(?P<serial>\d+)\s*"
+        r"(?P<value>\d+\.\d{3})\s*"
+        r"(?P<read_type>Active Import Interval kW)\s*"
+        r"(?P<date>\d{2}-\d{2}-\d{4})\s+"
+        r"(?P<time>\d{4})"
+    )
+
     rows = []
     for m in pattern.finditer(raw):
         rows.append({
-            "mprn": m.group(1),
-            "read_value_kw": float(m.group(2)),
-            "date": m.group(3),
-            "time": m.group(4),
+            "mprn": m.group("mprn"),
+            "meter_serial": m.group("serial"),
+            "read_value_kw": float(m.group("value")),
+            "date": m.group("date"),
+            "time": m.group("time"),
         })
+
+    if not rows:
+        fallback_lines = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if "Active Import Interval kW" not in line:
+                continue
+            m = re.search(
+                r"(?P<mprn>\d{11})\s*(?P<serial>\d+)\s*(?P<value>\d+\.\d{3})\s*Active Import Interval kW\s*(?P<date>\d{2}-\d{2}-\d{4})\s+(?P<time>\d{4})",
+                line,
+            )
+            if m:
+                fallback_lines.append({
+                    "mprn": m.group("mprn"),
+                    "meter_serial": m.group("serial"),
+                    "read_value_kw": float(m.group("value")),
+                    "date": m.group("date"),
+                    "time": m.group("time"),
+                })
+        rows = fallback_lines
+
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame(rows)
     df["reading_at"] = pd.to_datetime(df["date"] + " " + df["time"], format="%d-%m-%Y %H%M", errors="coerce")
     df = df.dropna(subset=["reading_at"]).sort_values("reading_at")
     df["interval_hours"] = 0.5
     df["estimated_kwh"] = df["read_value_kw"] * df["interval_hours"]
     df["date_only"] = df["reading_at"].dt.date
-    return df[["mprn", "reading_at", "read_value_kw", "estimated_kwh", "date_only"]]
+    return df[["mprn", "meter_serial", "reading_at", "read_value_kw", "estimated_kwh", "date_only"]]
 
 
 def add_bill(bill_date, due_date, amount, status, notes):
@@ -208,6 +239,7 @@ def sidebar_imports():
     parsed = parse_interval_csv(upload)
     if parsed.empty:
         st.sidebar.warning("Could not parse interval readings from that file.")
+        st.sidebar.caption("Expected format includes MPRN, meter serial, kW value, and date/time.")
         return
 
     st.sidebar.success(f"Parsed {len(parsed):,} rows")
