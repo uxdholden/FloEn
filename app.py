@@ -902,8 +902,8 @@ if df_raw is not None and not df_raw.empty:
             tot_cost = (dis_df[col_name] * dis_df["tariff_rate"]).sum()
             
             # Apply proportional standing charge and VAT
-            proportion = tot_kwh / total_kwh if total_kwh > 0 else 0
-            standing_apportioned = proportion * total_standing_charge
+            proportion = tot_kwh / actual_kwh if actual_kwh > 0 else 0
+            standing_apportioned = proportion * actual_standing_pso
             tot_gross_cost = (tot_cost + standing_apportioned) * (1 + rates["vat_rate"])
             
             app_costs_data.append({
