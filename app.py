@@ -301,16 +301,33 @@ if df_raw is not None and not df_raw.empty:
     df["day_name"] = df["reading_at"].dt.day_name()
     df["hour_of_day"] = df["reading_at"].dt.hour
     
-    # Aggregate Standing Charge Costs
-    unique_days = df["date_only"].nunique()
+    # --- MONTH FILTER SELECTOR ---
+    st.sidebar.markdown("---")
+    st.sidebar.header("📅 Filter Analysis View")
+    available_months = sorted(list(df["year_month"].unique()))
+    selected_month = st.sidebar.selectbox(
+        "Select Target Period:",
+        ["All Months"] + available_months,
+        index=0,
+        help="Filters the KPIs, projections, and heatmaps below to a single billing month."
+    )
+    
+    # Filter dataset accordingly
+    if selected_month != "All Months":
+        df_filtered = df[df["year_month"] == selected_month].copy()
+    else:
+        df_filtered = df.copy()
+
+    # Aggregate Standing Charge Costs (based on filtered days)
+    unique_days = df_filtered["date_only"].nunique()
     total_standing_charge = unique_days * rates["standing_charge"]
     
-    # 2. Key Metrics Calculations
-    total_kwh = df["estimated_kwh"].sum()
-    usage_cost = df["cost"].sum()
+    # 2. Key Metrics Calculations (Filtered)
+    total_kwh = df_filtered["estimated_kwh"].sum()
+    usage_cost = df_filtered["cost"].sum()
     gross_cost = (usage_cost + total_standing_charge) * (1 + rates["vat_rate"])
     
-    max_demand_row = df.loc[df["read_value_kw"].idxmax()]
+    max_demand_row = df_filtered.loc[df_filtered["read_value_kw"].idxmax()]
     max_demand_kw = max_demand_row["read_value_kw"]
     max_demand_time = max_demand_row["reading_at"].strftime("%d %b %H:%M")
     
@@ -323,7 +340,7 @@ if df_raw is not None and not df_raw.empty:
         st.metric(
             label="Total Consumption", 
             value=f"{total_kwh:,.1f} kWh", 
-            help="Sum of all interval energy usage during the logged period."
+            help="Sum of all interval energy usage during the selected period."
         )
     with col2:
         st.metric(
@@ -335,7 +352,7 @@ if df_raw is not None and not df_raw.empty:
         st.metric(
             label="Average Daily Cost", 
             value=f"€{avg_daily_cost:.2f}/day",
-            help="Total calculated cost divided by number of unique days tracked."
+            help="Total calculated cost divided by number of unique days in the selected period."
         )
     with col4:
         st.metric(
@@ -348,139 +365,193 @@ if df_raw is not None and not df_raw.empty:
     st.markdown("---")
     
     # TAB VIEW FOR SECTIONS
-    tab1, tab2, tab3 = st.tabs(["📊 Monthly & Cost Projections", "⏰ Hourly & Peak Analysis", "📅 Daily Patterns & Heatmaps"])
+    tab1, tab2, tab3 = st.tabs(["📊 Usage & Cost Projections", "⏰ Hourly & Peak Analysis", "📅 Daily Patterns & Heatmaps"])
     
     # --- TAB 1: MONTHLY & PROJECTIONS ---
     with tab1:
-        st.subheader("Monthly Usage, Actual Costs & Projections")
-        
-        # Monthly grouping
-        monthly_summary = df.groupby("year_month").agg(
-            total_kwh=("estimated_kwh", "sum"),
-            usage_cost=("cost", "sum"),
-            days_in_dataset=("date_only", "nunique")
-        ).reset_index()
-        
-        # Calculate standing charges and VAT per month
-        monthly_summary["standing_charges"] = monthly_summary["days_in_dataset"] * rates["standing_charge"]
-        monthly_summary["total_cost_inc_vat"] = (monthly_summary["usage_cost"] + monthly_summary["standing_charges"]) * (1 + rates["vat_rate"])
-        
-        # Current month projections logic
         current_year_month = datetime.now().strftime("%Y-%m")
-        has_current_month = current_year_month in monthly_summary["year_month"].values
         
-        projections_list = []
-        for index, row in monthly_summary.iterrows():
-            is_current = row["year_month"] == current_year_month
-            days_tracked = row["days_in_dataset"]
+        # Scenario A: ALL MONTHS Selected -> Show monthly comparison bars
+        if selected_month == "All Months":
+            st.subheader("Monthly Usage, Actual Costs & Projections")
             
-            # Estimate remaining days in month
-            year, month = map(int, row["year_month"].split("-"))
-            if month == 12:
-                next_month = datetime(year + 1, 1, 1)
-            else:
-                next_month = datetime(year, month + 1, 1)
-            total_days_in_month = (next_month - datetime(year, month, 1)).days
+            # Monthly grouping
+            monthly_summary = df.groupby("year_month").agg(
+                total_kwh=("estimated_kwh", "sum"),
+                usage_cost=("cost", "sum"),
+                days_in_dataset=("date_only", "nunique")
+            ).reset_index()
             
-            if is_current and days_tracked < total_days_in_month:
-                # Extrapolate for remaining days
-                avg_kwh_per_day = row["total_kwh"] / days_tracked
-                avg_cost_per_day = row["total_cost_inc_vat"] / days_tracked
+            # Calculate standing charges and VAT per month
+            monthly_summary["standing_charges"] = monthly_summary["days_in_dataset"] * rates["standing_charge"]
+            monthly_summary["total_cost_inc_vat"] = (monthly_summary["usage_cost"] + monthly_summary["standing_charges"]) * (1 + rates["vat_rate"])
+            
+            has_current_month = current_year_month in monthly_summary["year_month"].values
+            
+            projections_list = []
+            for index, row in monthly_summary.iterrows():
+                is_current = row["year_month"] == current_year_month
+                days_tracked = row["days_in_dataset"]
                 
-                projected_kwh = avg_kwh_per_day * total_days_in_month
-                projected_cost = avg_cost_per_day * total_days_in_month
+                # Estimate remaining days in month
+                year, month = map(int, row["year_month"].split("-"))
+                next_month = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+                total_days_in_month = (next_month - datetime(year, month, 1)).days
                 
-                projections_list.append({
-                    "Month": row["year_month"],
-                    "Status": "Projected (Full Month)",
-                    "Consumption (kWh)": projected_kwh,
-                    "Total Cost (€)": projected_cost
-                })
-                # Add actual-to-date entry
-                projections_list.append({
-                    "Month": row["year_month"],
-                    "Status": "Actual (To-Date)",
-                    "Consumption (kWh)": row["total_kwh"],
-                    "Total Cost (€)": row["total_cost_inc_vat"]
-                })
-            else:
-                projections_list.append({
-                    "Month": row["year_month"],
-                    "Status": "Actual (Complete)",
-                    "Consumption (kWh)": row["total_kwh"],
-                    "Total Cost (€)": row["total_cost_inc_vat"]
-                })
-                
-        proj_df = pd.DataFrame(projections_list)
-        
-        # Render charts for Monthly
-        m_col1, m_col2 = st.columns(2)
-        
-        with m_col1:
-            st.markdown("#### Monthly Consumption (kWh)")
-            fig_month_kwh = px.bar(
-                proj_df, 
-                x="Month", 
-                y="Consumption (kWh)", 
-                color="Status",
-                barmode="group",
-                color_discrete_map={
-                    "Actual (Complete)": "#1E88E5",
-                    "Actual (To-Date)": "#1565C0",
-                    "Projected (Full Month)": "#90CAF9"
-                },
-                text_auto=".0f"
-            )
-            fig_month_kwh.update_layout(xaxis_title="Month", yaxis_title="kWh Used", legend_title="Usage Category")
-            st.plotly_chart(fig_month_kwh, use_container_width=True)
+                if is_current and days_tracked < total_days_in_month:
+                    avg_kwh_per_day = row["total_kwh"] / days_tracked
+                    avg_cost_per_day = row["total_cost_inc_vat"] / days_tracked
+                    
+                    projected_kwh = avg_kwh_per_day * total_days_in_month
+                    projected_cost = avg_cost_per_day * total_days_in_month
+                    
+                    projections_list.append({
+                        "Month": row["year_month"],
+                        "Status": "Projected (Full Month)",
+                        "Consumption (kWh)": projected_kwh,
+                        "Total Cost (€)": projected_cost
+                    })
+                    projections_list.append({
+                        "Month": row["year_month"],
+                        "Status": "Actual (To-Date)",
+                        "Consumption (kWh)": row["total_kwh"],
+                        "Total Cost (€)": row["total_cost_inc_vat"]
+                    })
+                else:
+                    projections_list.append({
+                        "Month": row["year_month"],
+                        "Status": "Actual (Complete)",
+                        "Consumption (kWh)": row["total_kwh"],
+                        "Total Cost (€)": row["total_cost_inc_vat"]
+                    })
+                    
+            proj_df = pd.DataFrame(projections_list)
             
-        with m_col2:
-            st.markdown("#### Monthly Cost (€)")
-            fig_month_cost = px.bar(
-                proj_df, 
-                x="Month", 
-                y="Total Cost (€)", 
-                color="Status",
-                barmode="group",
-                color_discrete_map={
-                    "Actual (Complete)": "#2E7D32",
-                    "Actual (To-Date)": "#1B5E20",
-                    "Projected (Full Month)": "#A5D6A7"
-                },
-                text_auto=".2f"
-            )
-            fig_month_cost.update_layout(xaxis_title="Month", yaxis_title="Total Bill (€)", legend_title="Cost Status")
-            st.plotly_chart(fig_month_cost, use_container_width=True)
+            # Render charts for Monthly
+            m_col1, m_col2 = st.columns(2)
             
-        # Explanatory projection text card
-        if has_current_month:
-            this_month_proj = proj_df[(proj_df["Month"] == current_year_month) & (proj_df["Status"] == "Projected (Full Month)")]
-            this_month_act = proj_df[(proj_df["Month"] == current_year_month) & (proj_df["Status"] == "Actual (To-Date)")]
-            
-            if not this_month_proj.empty and not this_month_act.empty:
-                proj_val = this_month_proj["Total Cost (€)"].values[0]
-                act_val = this_month_act["Total Cost (€)"].values[0]
-                days_elapsed = monthly_summary[monthly_summary["year_month"] == current_year_month]["days_in_dataset"].values[0]
-                
-                st.info(
-                    f"🔮 **Current Month Projection ({current_year_month}):** Based on the first **{days_elapsed} days** of this month, "
-                    f"your actual usage cost so far is **€{act_val:.2f}**. "
-                    f"At your current rate of consumption, we project your final bill for this month to reach **€{proj_val:.2f}**."
+            with m_col1:
+                st.markdown("#### Monthly Consumption (kWh)")
+                fig_month_kwh = px.bar(
+                    proj_df, 
+                    x="Month", 
+                    y="Consumption (kWh)", 
+                    color="Status",
+                    barmode="group",
+                    color_discrete_map={
+                        "Actual (Complete)": "#1E88E5",
+                        "Actual (To-Date)": "#1565C0",
+                        "Projected (Full Month)": "#90CAF9"
+                    },
+                    text_auto=".0f"
                 )
+                fig_month_kwh.update_layout(xaxis_title="Month", yaxis_title="kWh Used", legend_title="Usage Category")
+                st.plotly_chart(fig_month_kwh, use_container_width=True)
+                
+            with m_col2:
+                st.markdown("#### Monthly Cost (€)")
+                fig_month_cost = px.bar(
+                    proj_df, 
+                    x="Month", 
+                    y="Total Cost (€)", 
+                    color="Status",
+                    barmode="group",
+                    color_discrete_map={
+                        "Actual (Complete)": "#2E7D32",
+                        "Actual (To-Date)": "#1B5E20",
+                        "Projected (Full Month)": "#A5D6A7"
+                    },
+                    text_auto=".2f"
+                )
+                fig_month_cost.update_layout(xaxis_title="Month", yaxis_title="Total Bill (€)", legend_title="Cost Status")
+                st.plotly_chart(fig_month_cost, use_container_width=True)
+                
+            # Explanatory projection text card
+            if has_current_month:
+                this_month_proj = proj_df[(proj_df["Month"] == current_year_month) & (proj_df["Status"] == "Projected (Full Month)")]
+                this_month_act = proj_df[(proj_df["Month"] == current_year_month) & (proj_df["Status"] == "Actual (To-Date)")]
+                
+                if not this_month_proj.empty and not this_month_act.empty:
+                    proj_val = this_month_proj["Total Cost (€)"].values[0]
+                    act_val = this_month_act["Total Cost (€)"].values[0]
+                    days_elapsed = monthly_summary[monthly_summary["year_month"] == current_year_month]["days_in_dataset"].values[0]
+                    
+                    st.info(
+                        f"🔮 **Current Month Projection ({current_year_month}):** Based on the first **{days_elapsed} days** of this month, "
+                        f"your actual usage cost so far is **€{act_val:.2f}**. "
+                        f"At your current rate of consumption, we project your final bill for this month to reach **€{proj_val:.2f}**."
+                    )
+        
+        # Scenario B: SPECIFIC MONTH SELECTED -> Zoom into Daily Granular View for that Month
+        else:
+            st.subheader(f"Daily Details for Selected Month: {selected_month}")
+            
+            daily_summary = df_filtered.groupby("date_only").agg(
+                total_kwh=("estimated_kwh", "sum"),
+                usage_cost=("cost", "sum")
+            ).reset_index()
+            
+            # Daily standing charge + VAT application
+            daily_summary["total_cost_inc_vat"] = (daily_summary["usage_cost"] + rates["standing_charge"]) * (1 + rates["vat_rate"])
+            
+            m_col1, m_col2 = st.columns(2)
+            
+            with m_col1:
+                st.markdown(f"#### Daily Consumption in {selected_month} (kWh)")
+                fig_daily_kwh = px.bar(
+                    daily_summary,
+                    x="date_only",
+                    y="total_kwh",
+                    color_discrete_sequence=["#1E88E5"]
+                )
+                fig_daily_kwh.update_layout(xaxis_title="Date", yaxis_title="Daily kWh")
+                st.plotly_chart(fig_daily_kwh, use_container_width=True)
+                
+            with m_col2:
+                st.markdown(f"#### Daily Cost in {selected_month} (€)")
+                fig_daily_cost = px.bar(
+                    daily_summary,
+                    x="date_only",
+                    y="total_cost_inc_vat",
+                    color_discrete_sequence=["#2E7D32"]
+                )
+                fig_daily_cost.update_layout(xaxis_title="Date", yaxis_title="Daily Cost Inc. VAT & Standing (€)")
+                st.plotly_chart(fig_daily_cost, use_container_width=True)
+            
+            # If the selected month is the active current month, offer daily extrapolation card
+            if selected_month == current_year_month:
+                days_elapsed = daily_summary["date_only"].nunique()
+                year, month = map(int, selected_month.split("-"))
+                next_month = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+                total_days_in_month = (next_month - datetime(year, month, 1)).days
+                
+                if days_elapsed < total_days_in_month:
+                    avg_daily_act_kwh = total_kwh / days_elapsed
+                    avg_daily_act_cost = gross_cost / days_elapsed
+                    
+                    proj_full_month_kwh = avg_daily_act_kwh * total_days_in_month
+                    proj_full_month_cost = avg_daily_act_cost * total_days_in_month
+                    
+                    st.info(
+                        f"🔮 **Projection for Current Month ({selected_month}):** Based on **{days_elapsed} elapsed days** of this month:\n"
+                        f"- **Current Accumulation:** {total_kwh:,.1f} kWh consumed with a total cost of **€{gross_cost:.2f}**.\n"
+                        f"- **Forecasted Month-End Usage:** **{proj_full_month_kwh:,.1f} kWh**.\n"
+                        f"- **Forecasted Month-End Cost:** **€{proj_full_month_cost:.2f}**."
+                    )
 
     # --- TAB 2: HOURLY & PEAK ANALYSIS ---
     with tab2:
         st.subheader("Usage Profile by Hour of Day & Weekday")
         
-        # Diurnal (hourly) usage profile
-        hourly_summary = df.groupby(["hour_of_day", "tariff_band"]).agg(
+        # Diurnal (hourly) usage profile (Filtered)
+        hourly_summary = df_filtered.groupby(["hour_of_day", "tariff_band"]).agg(
             avg_kwh=("estimated_kwh", "mean"),
             total_kwh=("estimated_kwh", "sum")
         ).reset_index()
         
-        # Weekday vs Weekend Average profile
-        df["day_type"] = np.where(df["reading_at"].dt.dayofweek < 5, "Weekday", "Weekend")
-        hourly_daytype_summary = df.groupby(["hour_of_day", "day_type"]).agg(
+        # Weekday vs Weekend Average profile (Filtered)
+        df_filtered["day_type"] = np.where(df_filtered["reading_at"].dt.dayofweek < 5, "Weekday", "Weekend")
+        hourly_daytype_summary = df_filtered.groupby(["hour_of_day", "day_type"]).agg(
             avg_kwh=("estimated_kwh", "mean")
         ).reset_index()
         
@@ -506,7 +577,7 @@ if df_raw is not None and not df_raw.empty:
             
         with h_col2:
             st.markdown("#### Cost Impact by Tariff Band")
-            tariff_breakdown = df.groupby("tariff_band").agg(
+            tariff_breakdown = df_filtered.groupby("tariff_band").agg(
                 total_kwh=("estimated_kwh", "sum"),
                 total_cost=("cost", "sum")
             ).reset_index()
@@ -529,8 +600,8 @@ if df_raw is not None and not df_raw.empty:
         
         with p_col1:
             # Highlight Peak bands
-            peak_only = df[df["tariff_band"] == "Peak"]
-            avg_peak_load = peak_only["read_value_kw"].mean()
+            peak_only = df_filtered[df_filtered["tariff_band"] == "Peak"]
+            avg_peak_load = peak_only["read_value_kw"].mean() if not peak_only.empty else 0.0
             st.markdown(
                 f"""
                 * **Peak Period (17:00 - 19:00):** Your average demand during evening peak window is **{avg_peak_load:.2f} kW**.
@@ -540,7 +611,7 @@ if df_raw is not None and not df_raw.empty:
             
         with p_col2:
             # Show highest peak usage days
-            top_peaks = df.sort_values(by="read_value_kw", ascending=False).head(5)
+            top_peaks = df_filtered.sort_values(by="read_value_kw", ascending=False).head(5)
             st.markdown("**Top 5 Single Highest Appliance Spikes Recorded:**")
             for _, r in top_peaks.iterrows():
                 st.write(f"- 🔴 **{r['read_value_kw']:.2f} kW** on {r['reading_at'].strftime('%A, %d %b %Y at %H:%M')}")
@@ -549,8 +620,8 @@ if df_raw is not None and not df_raw.empty:
     with tab3:
         st.subheader("Daily Trends and Heatmap Distribution")
         
-        # Line plot of daily usage
-        daily_kwh = df.groupby("date_only").agg(
+        # Line plot of daily usage (Filtered)
+        daily_kwh = df_filtered.groupby("date_only").agg(
             total_kwh=("estimated_kwh", "sum"),
             cost_inc_standing=("cost", lambda x: (x.sum() + rates["standing_charge"]) * (1 + rates["vat_rate"]))
         ).reset_index()
@@ -569,9 +640,9 @@ if df_raw is not None and not df_raw.empty:
         )
         st.plotly_chart(fig_daily, use_container_width=True)
         
-        # 2D Heatmap of hour vs day of week
+        # 2D Heatmap of hour vs day of week (Filtered)
         st.markdown("#### Hourly vs Day-of-Week Intensity Heatmap")
-        heatmap_data = df.groupby(["day_name", "hour_of_day"])["estimated_kwh"].mean().reset_index()
+        heatmap_data = df_filtered.groupby(["day_name", "hour_of_day"])["estimated_kwh"].mean().reset_index()
         
         # Sort days correctly
         day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
