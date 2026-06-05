@@ -209,8 +209,8 @@ def generate_demo_data() -> pd.DataFrame:
         read_val = max(0.01, base + activity + spike)
         
         rows.append({
-            "mprn": "10009998881",
-            "meter_serial": "MET-88392",
+            "mprn": "10303339574",
+            "meter_serial": "000000000024049722",
             "reading_at": dt,
             "read_value_kw": read_val * 2, # Convert kWh consumption back to kW demand
             "estimated_kwh": read_val,
@@ -250,6 +250,98 @@ def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
         df["tariff_rate"] = df["tariff_band"].map(rate_map)
         
     df["cost"] = df["estimated_kwh"] * df["tariff_rate"]
+    return df
+
+
+# --- HEURISTIC APPLIANCE DISAGGREGATION ENGINE ---
+def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFrame:
+    """
+    Uses NILM-style baseline subtraction and rules-based heuristic models
+    to disaggregate total half-hourly kWh usage into common household appliance groups.
+    """
+    df = df.copy()
+    
+    # 1. Identify daily baseline (Always On/Standby load)
+    # Group by date and find the minimum 30-min window consumption as the baseload power signature
+    daily_min = df.groupby("date_only")["estimated_kwh"].transform("min")
+    
+    # Always On: Runs continuously. We cap always-on at a reasonable 0.25 kWh per 30 mins (500W continuous)
+    df["app_always_on"] = np.minimum(daily_min, 0.25)
+    
+    # Remaining active consumption to disaggregate
+    df["active_kwh"] = np.maximum(0.0, df["estimated_kwh"] - df["app_always_on"])
+    
+    # Initialize disaggregated categories
+    df["app_ev"] = 0.0
+    df["app_heating"] = 0.0
+    df["app_cooking"] = 0.0
+    df["app_laundry"] = 0.0
+    df["app_entertainment"] = 0.0
+    df["app_misc"] = 0.0
+    
+    # Helper time flags
+    df["hour_float"] = df["reading_at"].dt.hour + df["reading_at"].dt.minute / 60.0
+    df["is_weekend"] = df["reading_at"].dt.dayofweek >= 5
+    
+    for idx, row in df.iterrows():
+        active = row["active_kwh"]
+        if active <= 0:
+            continue
+            
+        hr = row["hour_float"]
+        
+        # A. ELECTRIC VEHICLE (EV) CHARGING
+        # Standard home chargers pull 7.4 kW (which is ~3.7 kWh per 30 mins)
+        # Usually runs overnight (e.g., midnight to 6 AM)
+        if house_profile["has_ev"] and (0.0 <= hr < 6.0) and active > 1.5:
+            ev_draw = min(active, 3.7) # Cap at typical EV charger max output per half hour
+            df.at[idx, "app_ev"] = ev_draw
+            active -= ev_draw
+            
+        # B. SPACE & WATER HEATING
+        # High-power thermal draws in the morning (5:30 - 8:30) or night-boost (23:00 - 2:00)
+        if active > 0:
+            is_heating_window = (5.5 <= hr < 8.5) or (23.0 <= hr) or (0.0 <= hr < 2.0)
+            if is_heating_window:
+                heating_ratio = 0.6 if house_profile["electric_heating"] else 0.15
+                heat_draw = active * heating_ratio
+                df.at[idx, "app_heating"] = heat_draw
+                active -= heat_draw
+
+        # C. COOKING & KITCHEN APPLIANCES
+        # Confined to traditional meal prep windows: Breakfast (7:00-9:00), Lunch (12:00-14:00), Dinner (16:30-19:30)
+        if active > 0:
+            is_cooking_window = (7.0 <= hr < 9.0) or (12.0 <= hr < 14.0) or (16.5 <= hr < 19.5)
+            if is_cooking_window:
+                # Cooking involves short, sharp surges (kettles, hob, oven)
+                cooking_ratio = 0.55 if active > 0.15 else 0.3
+                cooking_draw = active * cooking_ratio
+                df.at[idx, "app_cooking"] = cooking_draw
+                active -= cooking_draw
+
+        # D. WET APPLIANCES (Laundry / Dishwasher)
+        # Typically run during morning chores (9:00-12:00), afternoon slots (14:00-16:30), or weekends.
+        # Marked by moderate continuous draws.
+        if active > 0:
+            is_chore_window = (9.0 <= hr < 12.0) or (14.0 <= hr < 16.5) or (row["is_weekend"] and 10.0 <= hr < 17.0)
+            if is_chore_window:
+                laundry_ratio = 0.5 if active > 0.2 else 0.2
+                laundry_draw = active * laundry_ratio
+                df.at[idx, "app_laundry"] = laundry_draw
+                active -= laundry_draw
+
+        # E. ENTERTAINMENT & LIGHTING
+        # Active evenings awake times (18:00 - 23:30)
+        if active > 0:
+            if 18.0 <= hr < 23.5:
+                ent_draw = active * 0.7
+                df.at[idx, "app_entertainment"] = ent_draw
+                active -= ent_draw
+                
+        # F. MISCELLANEOUS (unallocated active loads)
+        if active > 0:
+            df.at[idx, "app_misc"] = active
+            
     return df
 
 
@@ -328,10 +420,22 @@ vat_rate = st.sidebar.number_input(
     step=0.5
 ) / 100.0
 
-# Calculate combined daily standing charge (Standing Charge + PSO Levy converted to daily)
+# Combined daily standing charge calculations
 daily_standing_rate = (annual_standing + annual_pso) / 365.25
 rates["daily_standing_charge"] = daily_standing_rate
 rates["vat_rate"] = vat_rate
+
+
+# --- APPLIANCE DISAGGREGATION PROFILE SURVEY ---
+st.sidebar.markdown("---")
+st.sidebar.header("🔌 Household Profile Survey")
+st.sidebar.info("Fill out your appliance survey below to map statistical patterns to specific category groups, similar to Electric Ireland's portal.")
+
+house_profile = {
+    "has_ev": st.sidebar.checkbox("Do you own an Electric Vehicle (EV)?", value=False, help="Checks for heavy nightly charge loads (~3-7kW continuous draw overnight)"),
+    "electric_heating": st.sidebar.checkbox("Do you use electric space/water heating?", value=True, help="Allocates a larger signature weight to morning and winter spikes")
+}
+
 
 # --- LOAD DATA ---
 df_raw = None
@@ -419,7 +523,12 @@ if df_raw is not None and not df_raw.empty:
     st.markdown("---")
     
     # TAB VIEW FOR SECTIONS
-    tab1, tab2, tab3 = st.tabs(["📊 Usage & Cost Projections", "⏰ Hourly & Peak Analysis", "📅 Daily Patterns & Heatmaps"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 Usage & Cost Projections", 
+        "⏰ Hourly & Peak Analysis", 
+        "🔌 Appliance Breakdown", 
+        "📅 Daily Patterns & Heatmaps"
+    ])
     
     # --- TAB 1: MONTHLY & PROJECTIONS ---
     with tab1:
@@ -631,7 +740,6 @@ if df_raw is not None and not df_raw.empty:
             
         with h_col2:
             st.markdown("#### Consumption Share by Time Window")
-            # Even for flat rates, it's very useful to see when you consume power (mapped to standard Day/Night/Peak hours)
             df_temp = df_filtered.copy()
             conditions_temp = [
                 (df_temp["hour_of_day"] >= 23) | (df_temp["hour_of_day"] < 8),
@@ -660,7 +768,6 @@ if df_raw is not None and not df_raw.empty:
         p_col1, p_col2 = st.columns(2)
         
         with p_col1:
-            # Highlight Peak bands
             peak_only = df_filtered[(df_filtered["hour_of_day"] >= 17) & (df_filtered["hour_of_day"] < 19)]
             avg_peak_load = peak_only["read_value_kw"].mean() if not peak_only.empty else 0.0
             st.markdown(
@@ -671,14 +778,131 @@ if df_raw is not None and not df_raw.empty:
             )
             
         with p_col2:
-            # Show highest peak usage days
             top_peaks = df_filtered.sort_values(by="read_value_kw", ascending=False).head(5)
             st.markdown("**Top 5 Single Highest Appliance Spikes Recorded:**")
             for _, r in top_peaks.iterrows():
                 st.write(f"- 🔴 **{r['read_value_kw']:.2f} kW** on {r['reading_at'].strftime('%A, %d %b %Y at %H:%M')}")
 
-    # --- TAB 3: DAILY PATTERNS & HEATMAPS ---
+
+    # --- TAB 3: APPLIANCE BREAKDOWN ---
+    with tab4:
+        st.write("") # Kept intact as Tab 4 for formatting, but actual view will render under Appliance Breakdown below.
+
     with tab3:
+        st.subheader("🔌 Replicated Appliance Disaggregation")
+        st.markdown(
+            "Below is the estimated category breakdown of your smart meter data using a statistical baseline and time-of-day heuristic engine. "
+            "Update your household profile questions in the sidebar to refine this output."
+        )
+        
+        # Run Heuristics Engine
+        dis_df = disaggregate_appliances(df_filtered, house_profile)
+        
+        # Sum up disaggregated columns
+        app_cols = {
+            "app_always_on": "Always On (Baseload)",
+            "app_heating": "Space & Water Heating",
+            "app_cooking": "Cooking & Kitchen",
+            "app_laundry": "Laundry & Dishwasher",
+            "app_entertainment": "Entertainment & Lighting",
+            "app_ev": "Electric Vehicle (EV)",
+            "app_misc": "Other / Unclassified"
+        }
+        
+        # Calculate sums and costs per appliance
+        app_data = []
+        for col_name, label in app_cols.items():
+            if col_name == "app_ev" and not house_profile["has_ev"]:
+                continue
+                
+            total_app_kwh = dis_df[col_name].sum()
+            
+            # Map cost proportionally based on interval-specific tariff rates
+            # This handles cases where certain appliances run heavily on flat vs. time-of-use night rates
+            if "cost" in dis_df.columns:
+                total_app_cost = (dis_df[col_name] * dis_df["tariff_rate"]).sum()
+            else:
+                total_app_cost = total_app_kwh * (rates.get("flat_rate") if rates["type"] == "flat" else rates.get("day_rate", 0.30))
+                
+            # Apply proportional standing charge and VAT
+            app_share = total_app_kwh / total_kwh if total_kwh > 0 else 0
+            allocated_standing_vat = (total_standing_charge * app_share) * (1 + rates["vat_rate"])
+            total_app_cost_inc_vat = (total_app_cost * (1 + rates["vat_rate"])) + allocated_standing_vat
+            
+            app_data.append({
+                "Appliance Category": label,
+                "Consumption (kWh)": total_app_kwh,
+                "Estimated Cost (€)": total_app_cost_inc_vat
+            })
+            
+        app_summary = pd.DataFrame(app_data)
+        
+        # Render disaggregation visualizations
+        app_col1, app_col2 = st.columns(2)
+        
+        with app_col1:
+            st.markdown("#### Appliance Energy Share (%)")
+            fig_app_pie = px.pie(
+                app_summary,
+                values="Consumption (kWh)",
+                names="Appliance Category",
+                color="Appliance Category",
+                color_discrete_sequence=px.colors.qualitative.Pastel,
+                hole=0.4
+            )
+            fig_app_pie.update_traces(textinfo="percent+label")
+            st.plotly_chart(fig_app_pie, use_container_width=True)
+            
+        with app_col2:
+            st.markdown("#### Estimated Cost Breakdown (€)")
+            fig_app_cost = px.bar(
+                app_summary.sort_values(by="Estimated_Cost", s=False) if "Estimated_Cost" in app_summary else app_summary,
+                x="Appliance Category",
+                y="Estimated Cost (€)",
+                text_auto=".2f",
+                color="Appliance Category",
+                color_discrete_sequence=px.colors.qualitative.Pastel
+            )
+            fig_app_cost.update_layout(xaxis_title="Category", yaxis_title="Total Bill Portion (€)", showlegend=False)
+            st.plotly_chart(fig_app_cost, use_container_width=True)
+            
+        st.markdown("---")
+        st.markdown("#### 🕒 Average Diurnal Appliance Timeline")
+        st.markdown("This chart displays how your dynamic appliance loads shift and overlap throughout an average 24-hour day in your selected dataset.")
+        
+        # Group by hour of day for stacked timeline
+        timeline_cols = list(app_cols.keys())
+        if not house_profile["has_ev"]:
+            timeline_cols.remove("app_ev")
+            
+        hourly_timeline = dis_df.groupby("hour_of_day")[timeline_cols].mean().reset_index()
+        hourly_timeline = hourly_timeline.rename(columns=app_cols)
+        
+        # Melt dataframe for easy stacked charting
+        melted_timeline = hourly_timeline.melt(
+            id_vars=["hour_of_day"],
+            value_vars=list(hourly_timeline.columns[1:]),
+            var_name="Appliance Category",
+            value_name="Average Hourly Consumption (kWh)"
+        )
+        
+        fig_timeline = px.bar(
+            melted_timeline,
+            x="hour_of_day",
+            y="Average Hourly Consumption (kWh)",
+            color="Appliance Category",
+            color_discrete_sequence=px.colors.qualitative.Pastel
+        )
+        fig_timeline.update_layout(
+            xaxis=dict(tickmode="linear", tick0=0, dtick=1),
+            xaxis_title="Hour of Day (24h Stacked View)",
+            yaxis_title="Avg Consumption per Hour (kWh)"
+        )
+        st.plotly_chart(fig_timeline, use_container_width=True)
+
+
+    # --- TAB 4: DAILY PATTERNS & HEATMAPS ---
+    with tab4:
         st.subheader("Daily Trends and Heatmap Distribution")
         
         # Line plot of daily usage (Filtered)
