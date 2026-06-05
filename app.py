@@ -5,6 +5,8 @@ import calendar
 from datetime import date, datetime
 
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -152,7 +154,7 @@ def calc_electricity_month(month_df, annual_standing_charge, annual_pso, unit_ra
 
     projected_total = projected_usage_cost + projected_standing_cost + projected_pso_cost
 
-    return {
+    result = {
         "month": month_key,
         "is_current_month": is_current_month,
         "actual_days_with_data": actual_days_with_data,
@@ -167,48 +169,45 @@ def calc_electricity_month(month_df, annual_standing_charge, annual_pso, unit_ra
         "projected_standing_cost": round(projected_standing_cost, 2),
         "projected_pso_cost": round(projected_pso_cost, 2),
         "projected_total": round(projected_total, 2),
+        "standing_daily": round(standing_daily, 4),
+        "pso_daily": round(pso_daily, 4),
     }
+    return result
 
 
-def calc_gas_month(month_key, gas_kwh, annual_standing_charge, annual_carbon_tax, unit_rate_eur):
-    dt = datetime.strptime(month_key, "%Y-%m")
-    total_days = days_in_month(dt.year, dt.month)
-    today = date.today()
-    is_current_month = today.strftime("%Y-%m") == month_key
+def add_daily_cost_columns(df, annual_standing_charge, annual_pso, unit_rate_eur):
+    if df.empty:
+        return df.copy()
 
+    out = df.copy()
     standing_daily = annual_standing_charge / 365.0
-    carbon_daily = annual_carbon_tax / 365.0
+    pso_daily = annual_pso / 365.0
 
-    usage_cost = gas_kwh * unit_rate_eur
-    full_standing = standing_daily * total_days
-    full_carbon = carbon_daily * total_days
-    full_total = usage_cost + full_standing + full_carbon
-
-    return {
-        "month": month_key,
-        "is_current_month": is_current_month,
-        "kwh": round(gas_kwh, 2),
-        "usage_cost": round(usage_cost, 2),
-        "standing_cost": round(full_standing, 2),
-        "carbon_cost": round(full_carbon, 2),
-        "total": round(full_total, 2),
-    }
+    out["usage_cost"] = out["kwh"] * unit_rate_eur
+    out["standing_cost"] = standing_daily
+    out["pso_cost"] = pso_daily
+    out["daily_total_cost"] = out["usage_cost"] + out["standing_cost"] + out["pso_cost"]
+    out["cumulative_cost"] = out.groupby("month")["daily_total_cost"].cumsum()
+    return out
 
 
-@st.cache_data
-def convert_df_to_csv(df):
-    return df.to_csv(index=False).encode("utf-8")
+def theme_layout(fig, title):
+    fig.update_layout(
+        title=title,
+        template="plotly_white",
+        margin=dict(l=20, r=20, t=60, b=20),
+        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
 
 
 st.set_page_config(page_title="FloEn", layout="wide")
 st.title("FloEn")
-st.caption("Electricity + gas dashboard with ESB upload and manual gas entry")
+st.caption("Electricity dashboard with ESB upload, month selector, and projected current-month bill")
 
 required = [
     "APP_PASSWORD",
-    "GAS_UNIT_RATE_CENT",
-    "GAS_STANDING_CHARGE_ANNUAL",
-    "GAS_CARBON_TAX_ANNUAL",
     "ELEC_UNIT_RATE_CENT",
     "ELEC_STANDING_CHARGE_URBAN_ANNUAL",
     "ELEC_PSO_LEVY_ANNUAL",
@@ -231,9 +230,6 @@ if "raw_records" not in st.session_state:
 if "source_name" not in st.session_state:
     st.session_state.source_name = None
 
-if "gas_entries" not in st.session_state:
-    st.session_state.gas_entries = []
-
 app_password = get_secret("APP_PASSWORD")
 
 if not st.session_state.authenticated:
@@ -249,42 +245,20 @@ if not st.session_state.authenticated:
             st.error("Incorrect password.")
     st.stop()
 
-gas_unit_rate_eur = float(get_secret("GAS_UNIT_RATE_CENT")) / 100.0
-gas_standing_annual = float(get_secret("GAS_STANDING_CHARGE_ANNUAL"))
-gas_carbon_annual = float(get_secret("GAS_CARBON_TAX_ANNUAL"))
-
 elec_unit_rate_eur = float(get_secret("ELEC_UNIT_RATE_CENT")) / 100.0
 elec_standing_annual = float(get_secret("ELEC_STANDING_CHARGE_URBAN_ANNUAL"))
 elec_pso_annual = float(get_secret("ELEC_PSO_LEVY_ANNUAL"))
 
 with st.sidebar:
-    st.header("Electricity")
+    st.header("Upload")
     uploaded_file = st.file_uploader("Upload ESB CSV file", type=["csv"])
     st.caption("Upload your ESB electricity usage CSV.")
 
     st.divider()
-    st.header("Gas entries")
-    gas_upload = st.file_uploader("Import gas CSV", type=["csv"], key="gas_csv_upload")
-    if gas_upload is not None:
-        try:
-            gas_df_import = pd.read_csv(gas_upload)
-            required_cols = {"month", "gas_kwh"}
-            if required_cols.issubset(set(gas_df_import.columns)):
-                st.session_state.gas_entries = gas_df_import[["month", "gas_kwh"]].to_dict("records")
-                st.success("Gas CSV imported.")
-            else:
-                st.error("Gas CSV must contain: month, gas_kwh")
-        except Exception as e:
-            st.error(f"Could not import gas CSV: {e}")
-
-    st.divider()
     st.header("Tariffs in use")
-    st.write(f"Electricity unit rate: €{elec_unit_rate_eur:.4f}/kWh")
-    st.write(f"Electricity standing charge: €{elec_standing_annual:.2f}/year")
-    st.write(f"Electricity PSO levy: €{elec_pso_annual:.2f}/year")
-    st.write(f"Gas unit rate: €{gas_unit_rate_eur:.4f}/kWh")
-    st.write(f"Gas standing charge: €{gas_standing_annual:.2f}/year")
-    st.write(f"Gas carbon tax: €{gas_carbon_annual:.2f}/year")
+    st.write(f"Unit rate: €{elec_unit_rate_eur:.4f}/kWh")
+    st.write(f"Standing charge: €{elec_standing_annual:.2f}/year")
+    st.write(f"PSO levy: €{elec_pso_annual:.2f}/year")
 
 if uploaded_file is not None:
     try:
@@ -298,7 +272,10 @@ if uploaded_file is not None:
                 st.write(list(records[0].keys()))
             st.stop()
 
-        st.session_state.electricity_df = to_df(daily_rows)
+        df = to_df(daily_rows)
+        df = add_daily_cost_columns(df, elec_standing_annual, elec_pso_annual, elec_unit_rate_eur)
+
+        st.session_state.electricity_df = df
         st.session_state.raw_records = records
         st.session_state.source_name = uploaded_file.name
         st.session_state.detected_date_key = detected_date_key
@@ -308,197 +285,199 @@ if uploaded_file is not None:
         st.error(f"Upload failed: {e}")
         st.stop()
 
-st.subheader("Gas monthly input")
-with st.form("gas_monthly_form"):
-    c1, c2 = st.columns(2)
-    current_month = date.today().strftime("%Y-%m")
-    gas_month = c1.text_input("Month (YYYY-MM)", value=current_month)
-    gas_kwh = c2.number_input("Gas usage for month (kWh)", min_value=0.0, value=0.0, step=1.0)
-    add_gas = st.form_submit_button("Add / update gas month")
-
-if add_gas:
-    try:
-        datetime.strptime(gas_month, "%Y-%m")
-        existing = {row["month"]: row for row in st.session_state.gas_entries}
-        existing[gas_month] = {"month": gas_month, "gas_kwh": float(gas_kwh)}
-        st.session_state.gas_entries = sorted(existing.values(), key=lambda x: x["month"])
-        st.success(f"Saved gas entry for {gas_month}.")
-    except ValueError:
-        st.error("Month must be in YYYY-MM format.")
-
-gas_entries_df = pd.DataFrame(st.session_state.gas_entries)
-if not gas_entries_df.empty:
-    gas_csv = convert_df_to_csv(gas_entries_df)
-    st.download_button(
-        "Download gas entries CSV",
-        gas_csv,
-        file_name="gas_entries.csv",
-        mime="text/csv",
-    )
-
-available_months = set()
-
-if not st.session_state.electricity_df.empty:
-    available_months.update(st.session_state.electricity_df["month"].dropna().unique().tolist())
-
-if not gas_entries_df.empty:
-    available_months.update(gas_entries_df["month"].dropna().unique().tolist())
-
-if not available_months:
-    st.info("Upload an electricity CSV and/or add a gas month to begin.")
+if st.session_state.electricity_df.empty:
+    st.info("Unlock the app and upload your ESB CSV file to begin.")
     st.stop()
 
-available_months = sorted(available_months, reverse=True)
+df = st.session_state.electricity_df.copy()
+available_months = sorted(df["month"].dropna().unique().tolist(), reverse=True)
+
 selected_month = st.selectbox(
     "Select month",
     available_months,
     format_func=month_label_from_key,
 )
 
-electricity_result = None
-gas_result = None
+month_df = df[df["month"] == selected_month].copy()
+month_result = calc_electricity_month(
+    month_df,
+    elec_standing_annual,
+    elec_pso_annual,
+    elec_unit_rate_eur,
+)
 
-if not st.session_state.electricity_df.empty:
-    elec_month_df = st.session_state.electricity_df[
-        st.session_state.electricity_df["month"] == selected_month
-    ].copy()
-    if not elec_month_df.empty:
-        electricity_result = calc_electricity_month(
-            elec_month_df,
-            elec_standing_annual,
-            elec_pso_annual,
-            elec_unit_rate_eur,
-        )
+st.write(f"Source file: {st.session_state.source_name}")
+st.write(
+    f"Detected date column: `{st.session_state.detected_date_key}` | "
+    f"Detected value column: `{st.session_state.detected_value_key}`"
+)
 
-if not gas_entries_df.empty:
-    gas_match = gas_entries_df[gas_entries_df["month"] == selected_month]
-    if not gas_match.empty:
-        gas_kwh_selected = float(gas_match.iloc[0]["gas_kwh"])
-        gas_result = calc_gas_month(
-            selected_month,
-            gas_kwh_selected,
-            gas_standing_annual,
-            gas_carbon_annual,
-            gas_unit_rate_eur,
-        )
+top1, top2, top3, top4 = st.columns(4)
+top1.metric("Actual kWh", f"{month_result['actual_kwh']:.2f}")
+top2.metric("Usage charge", f"€{month_result['actual_usage_cost']:.2f}")
 
-st.subheader(f"Summary for {month_label_from_key(selected_month)}")
-
-col1, col2, col3 = st.columns(3)
-
-combined_actual = 0.0
-combined_projected = 0.0
-
-if electricity_result:
-    if electricity_result["is_current_month"]:
-        elec_total_to_show = electricity_result["projected_total"]
-        elec_label = "Electricity Projected"
-    else:
-        elec_total_to_show = electricity_result["actual_total"]
-        elec_label = "Electricity Total"
-
-    combined_actual += electricity_result["actual_total"]
-    combined_projected += electricity_result["projected_total"]
-
-    col1.metric(elec_label, f"€{elec_total_to_show:.2f}")
+if month_result["is_current_month"]:
+    top3.metric("Projected kWh", f"{month_result['projected_kwh']:.2f}")
+    top4.metric("Projected bill", f"€{month_result['projected_total']:.2f}")
+    st.info(
+        f"Projection for {month_label_from_key(selected_month)} is based on "
+        f"{month_result['actual_days_with_data']} day(s) of data out of "
+        f"{month_result['days_in_month']} days."
+    )
 else:
-    col1.metric("Electricity", "—")
+    top3.metric("Standing + PSO", f"€{month_result['actual_standing_cost'] + month_result['actual_pso_cost']:.2f}")
+    top4.metric("Month total", f"€{month_result['actual_total']:.2f}")
 
-if gas_result:
-    combined_actual += gas_result["total"]
-    combined_projected += gas_result["total"]
-    col2.metric("Gas Total", f"€{gas_result['total']:.2f}")
-else:
-    col2.metric("Gas", "—")
+chart_tab, breakdown_tab, data_tab = st.tabs(["Charts", "Breakdown", "Data"])
 
-if selected_month == date.today().strftime("%Y-%m"):
-    col3.metric("Combined Projected", f"€{combined_projected:.2f}")
-else:
-    col3.metric("Combined Total", f"€{combined_actual:.2f}")
+with chart_tab:
+    c1, c2 = st.columns(2)
 
-tab1, tab2, tab3, tab4 = st.tabs(["Combined", "Electricity", "Gas", "Data"])
+    line_fig = px.line(
+        month_df,
+        x="date",
+        y="kwh",
+        markers=True,
+        labels={"date": "Date", "kwh": "kWh"},
+    )
+    line_fig.update_traces(line_color="#0f766e", marker_color="#0f766e")
+    theme_layout(line_fig, f"Daily Usage Trend — {month_label_from_key(selected_month)}")
+    c1.plotly_chart(line_fig, use_container_width=True)
 
-with tab1:
-    rows = []
-    if electricity_result:
-        rows.append(
-            {
-                "source": "Electricity",
-                "usage_cost": electricity_result["projected_usage_cost"] if electricity_result["is_current_month"] else electricity_result["actual_usage_cost"],
-                "fixed_charge_1": electricity_result["projected_standing_cost"] if electricity_result["is_current_month"] else electricity_result["actual_standing_cost"],
-                "fixed_charge_2": electricity_result["projected_pso_cost"] if electricity_result["is_current_month"] else electricity_result["actual_pso_cost"],
-                "total": electricity_result["projected_total"] if electricity_result["is_current_month"] else electricity_result["actual_total"],
-            }
+    bar_fig = px.bar(
+        month_df,
+        x="date",
+        y="daily_total_cost",
+        labels={"date": "Date", "daily_total_cost": "€"},
+    )
+    bar_fig.update_traces(marker_color="#2563eb")
+    theme_layout(bar_fig, f"Daily Cost — {month_label_from_key(selected_month)}")
+    c2.plotly_chart(bar_fig, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+
+    area_fig = go.Figure()
+    area_fig.add_trace(
+        go.Scatter(
+            x=month_df["date"],
+            y=month_df["cumulative_cost"],
+            mode="lines",
+            fill="tozeroy",
+            line=dict(color="#7c3aed", width=3),
+            name="Cumulative cost",
         )
-    if gas_result:
-        rows.append(
-            {
-                "source": "Gas",
-                "usage_cost": gas_result["usage_cost"],
-                "fixed_charge_1": gas_result["standing_cost"],
-                "fixed_charge_2": gas_result["carbon_cost"],
-                "total": gas_result["total"],
-            }
-        )
-    if rows:
-        combined_df = pd.DataFrame(rows)
-        st.dataframe(combined_df, use_container_width=True)
+    )
+    theme_layout(area_fig, f"Cumulative Cost — {month_label_from_key(selected_month)}")
+    c3.plotly_chart(area_fig, use_container_width=True)
 
-with tab2:
-    if electricity_result:
-        st.write(f"Electricity source file: {st.session_state.source_name}")
-        st.write(
-            f"Detected date column: `{st.session_state.detected_date_key}` | "
-            f"Detected value column: `{st.session_state.detected_value_key}`"
-        )
-
-        e1, e2, e3, e4 = st.columns(4)
-        e1.metric("Actual kWh", f"{electricity_result['actual_kwh']:.2f}")
-        e2.metric("Usage charge", f"€{(electricity_result['projected_usage_cost'] if electricity_result['is_current_month'] else electricity_result['actual_usage_cost']):.2f}")
-        e3.metric("Standing charge", f"€{(electricity_result['projected_standing_cost'] if electricity_result['is_current_month'] else electricity_result['actual_standing_cost']):.2f}")
-        e4.metric("PSO levy", f"€{(electricity_result['projected_pso_cost'] if electricity_result['is_current_month'] else electricity_result['actual_pso_cost']):.2f}")
-
-        if electricity_result["is_current_month"]:
-            st.info(
-                f"Current month projection based on {electricity_result['actual_days_with_data']} day(s) of data out of {electricity_result['days_in_month']} days."
+    pie_values = (
+        [month_result["projected_usage_cost"], month_result["projected_standing_cost"], month_result["projected_pso_cost"]]
+        if month_result["is_current_month"]
+        else [month_result["actual_usage_cost"], month_result["actual_standing_cost"], month_result["actual_pso_cost"]]
+    )
+    donut_fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=["Usage", "Standing charge", "PSO levy"],
+                values=pie_values,
+                hole=0.55,
+                marker=dict(colors=["#0f766e", "#2563eb", "#f59e0b"]),
             )
-            st.metric("Projected electricity total", f"€{electricity_result['projected_total']:.2f}")
-        else:
-            st.metric("Electricity total", f"€{electricity_result['actual_total']:.2f}")
+        ]
+    )
+    theme_layout(donut_fig, f"Bill Breakdown — {month_label_from_key(selected_month)}")
+    c4.plotly_chart(donut_fig, use_container_width=True)
 
-        elec_df = st.session_state.electricity_df.copy()
-        elec_df["date"] = pd.to_datetime(elec_df["date"])
-        st.line_chart(elec_df.set_index("date")["kwh"])
-        st.dataframe(
-            elec_df[elec_df["month"] == selected_month][["date", "kwh", "avg_kwh_per_hour"]],
-            use_container_width=True,
+    c5, c6 = st.columns(2)
+
+    scatter_fig = px.scatter(
+        month_df,
+        x="kwh",
+        y="daily_total_cost",
+        size="kwh",
+        color="avg_kwh_per_hour",
+        hover_data=["date"],
+        labels={"kwh": "Daily kWh", "daily_total_cost": "Daily cost (€)", "avg_kwh_per_hour": "Avg kWh/hour"},
+        color_continuous_scale="Tealgrn",
+    )
+    theme_layout(scatter_fig, f"Usage vs Cost — {month_label_from_key(selected_month)}")
+    c5.plotly_chart(scatter_fig, use_container_width=True)
+
+    hist_fig = px.histogram(
+        month_df,
+        x="kwh",
+        nbins=min(12, max(5, len(month_df))),
+        labels={"kwh": "Daily kWh"},
+    )
+    hist_fig.update_traces(marker_color="#dc2626")
+    theme_layout(hist_fig, f"Usage Distribution — {month_label_from_key(selected_month)}")
+    c6.plotly_chart(hist_fig, use_container_width=True)
+
+    st.subheader("Monthly comparison")
+    monthly_summary = (
+        df.groupby("month", as_index=False)
+        .agg(
+            kwh=("kwh", "sum"),
+            usage_cost=("usage_cost", "sum"),
+            standing_cost=("standing_cost", "sum"),
+            pso_cost=("pso_cost", "sum"),
+            total_cost=("daily_total_cost", "sum"),
+        )
+        .sort_values("month")
+    )
+    monthly_summary["month_label"] = monthly_summary["month"].apply(month_label_from_key)
+
+    monthly_fig = px.bar(
+        monthly_summary,
+        x="month_label",
+        y=["usage_cost", "standing_cost", "pso_cost"],
+        labels={"value": "€", "month_label": "Month", "variable": "Component"},
+        barmode="stack",
+    )
+    theme_layout(monthly_fig, "Monthly Cost Components")
+    st.plotly_chart(monthly_fig, use_container_width=True)
+
+with breakdown_tab:
+    left, right = st.columns(2)
+
+    if month_result["is_current_month"]:
+        breakdown_df = pd.DataFrame(
+            [
+                {"component": "Usage", "amount": month_result["projected_usage_cost"]},
+                {"component": "Standing charge", "amount": month_result["projected_standing_cost"]},
+                {"component": "PSO levy", "amount": month_result["projected_pso_cost"]},
+                {"component": "Projected total", "amount": month_result["projected_total"]},
+            ]
         )
     else:
-        st.info("No electricity data for the selected month.")
+        breakdown_df = pd.DataFrame(
+            [
+                {"component": "Usage", "amount": month_result["actual_usage_cost"]},
+                {"component": "Standing charge", "amount": month_result["actual_standing_cost"]},
+                {"component": "PSO levy", "amount": month_result["actual_pso_cost"]},
+                {"component": "Month total", "amount": month_result["actual_total"]},
+            ]
+        )
 
-with tab3:
-    if gas_result:
-        g1, g2, g3, g4 = st.columns(4)
-        g1.metric("Gas kWh", f"{gas_result['kwh']:.2f}")
-        g2.metric("Usage charge", f"€{gas_result['usage_cost']:.2f}")
-        g3.metric("Standing charge", f"€{gas_result['standing_cost']:.2f}")
-        g4.metric("Carbon tax", f"€{gas_result['carbon_cost']:.2f}")
-        st.metric("Gas total", f"€{gas_result['total']:.2f}")
-    else:
-        st.info("No gas entry for the selected month.")
+    left.subheader("Cost breakdown")
+    left.dataframe(breakdown_df, use_container_width=True)
 
-    if not gas_entries_df.empty:
-        st.dataframe(gas_entries_df.sort_values("month", ascending=False), use_container_width=True)
+    summary_rows = [
+        {"item": "Unit rate", "value": f"€{elec_unit_rate_eur:.4f}/kWh"},
+        {"item": "Standing charge daily", "value": f"€{month_result['standing_daily']:.4f}"},
+        {"item": "PSO levy daily", "value": f"€{month_result['pso_daily']:.4f}"},
+        {"item": "Days with data", "value": str(month_result["actual_days_with_data"])},
+        {"item": "Days in month", "value": str(month_result["days_in_month"])},
+    ]
+    right.subheader("Month details")
+    right.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
-with tab4:
-    st.subheader("Electricity processed data")
-    if not st.session_state.electricity_df.empty:
-        st.dataframe(st.session_state.electricity_df, use_container_width=True)
-    else:
-        st.info("No electricity data uploaded.")
+with data_tab:
+    st.subheader("Selected month data")
+    st.dataframe(
+        month_df[["date", "kwh", "avg_kwh_per_hour", "usage_cost", "standing_cost", "pso_cost", "daily_total_cost", "cumulative_cost"]],
+        use_container_width=True,
+    )
 
-    st.subheader("Gas entries")
-    if not gas_entries_df.empty:
-        st.dataframe(gas_entries_df, use_container_width=True)
-    else:
-        st.info("No gas entries yet.")
+    st.subheader("All processed data")
+    st.dataframe(df, use_container_width=True)
