@@ -28,7 +28,13 @@ def get_settings_from_html(content: bytes) -> dict:
     return json.loads(match.group(1).decode("utf-8"))
 
 
-def login_and_download(session: requests.Session, username: str, password: str, mprn: str, search_type: str = "intervalkw") -> str:
+def login_and_download(
+    session: requests.Session,
+    username: str,
+    password: str,
+    mprn: str,
+    search_type: str = "intervalkw",
+) -> str:
     r1 = session.get(f"{BASE_URL}/", allow_redirects=True, timeout=(15, 15))
     r1.raise_for_status()
     settings = get_settings_from_html(r1.content)
@@ -58,7 +64,12 @@ def login_and_download(session: requests.Session, username: str, password: str, 
 
     r3 = session.get(
         f"{LOGIN_URL}/esbntwkscustportalprdb2c01.onmicrosoft.com/B2C_1A_signup_signin/api/CombinedSigninAndSignup/confirmed",
-        params={"rememberMe": False, "csrf_token": csrf, "tx": trans_id, "p": "B2C_1A_signup_signin"},
+        params={
+            "rememberMe": False,
+            "csrf_token": csrf,
+            "tx": trans_id,
+            "p": "B2C_1A_signup_signin",
+        },
         timeout=(15, 15),
     )
     r3.raise_for_status()
@@ -66,6 +77,7 @@ def login_and_download(session: requests.Session, username: str, password: str, 
     form = soup3.find("form", {"id": "auto"})
     if not form:
         raise RuntimeError("Could not complete login flow. ESB may have challenged the session.")
+
     login_url = form.get("action")
     state = form.find("input", {"name": "state"}).get("value")
     client_info = form.find("input", {"name": "client_info"}).get("value")
@@ -110,18 +122,54 @@ def login_and_download(session: requests.Session, username: str, password: str, 
     return content
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_esb_csv_cached(
+    username: str,
+    password: str,
+    mprn: str,
+    search_type: str,
+    user_agent: str,
+):
+    session = requests.Session()
+    session.headers.update({"User-Agent": user_agent})
+    try:
+        return login_and_download(session, username, password, mprn, search_type)
+    finally:
+        session.close()
+
+
 def csv_to_records(csv_text: str):
     return list(csv.DictReader(io.StringIO(csv_text)))
 
 
 def aggregate_daily(records):
-    date_candidates = ["Read Date and End Time", "Read Date", "Date", "Interval End", "Meter Read Date"]
-    value_candidates = ["Read Value", "Consumption", "kWh", "Active Import Interval (kW)", "Interval Read"]
+    date_candidates = [
+        "Read Date and End Time",
+        "Read Date",
+        "Date",
+        "Interval End",
+        "Meter Read Date",
+    ]
+    value_candidates = [
+        "Read Value",
+        "Consumption",
+        "kWh",
+        "Active Import Interval (kW)",
+        "Interval Read",
+    ]
 
     def parse_date(value: str):
         if not value:
             return None
-        for fmt in ("%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        for fmt in (
+            "%d-%m-%Y %H:%M",
+            "%d/%m/%Y %H:%M",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%d-%m-%Y",
+            "%d/%m/%Y",
+            "%Y-%m-%d",
+        ):
             try:
                 return datetime.strptime(value.strip(), fmt).date()
             except Exception:
@@ -132,7 +180,7 @@ def aggregate_daily(records):
         if value is None:
             return None
         try:
-            return float(value.strip().replace(',', ''))
+            return float(value.strip().replace(",", ""))
         except Exception:
             return None
 
@@ -153,25 +201,35 @@ def aggregate_daily(records):
     rows = []
     for day in sorted(daily):
         kwh = round(daily[day], 4)
-        rows.append({"date": day, "kwh": kwh, "avg_kwh_per_hour": round(kwh / 24.0, 4)})
+        rows.append(
+            {
+                "date": day,
+                "kwh": kwh,
+                "avg_kwh_per_hour": round(kwh / 24.0, 4),
+            }
+        )
     return rows
 
 
 def add_costs(daily_rows, unit_rate, standing_charge):
     if not daily_rows:
         return []
+
     avg_daily = sum(r["kwh"] for r in daily_rows) / len(daily_rows)
     projected_month_cost = (avg_daily * unit_rate + standing_charge) * 30
+
     out = []
     for row in daily_rows:
         daily_cost = row["kwh"] * unit_rate + standing_charge
-        out.append({
-            **row,
-            "unit_rate": round(unit_rate, 6),
-            "standing_charge": round(standing_charge, 6),
-            "daily_cost": round(daily_cost, 4),
-            "projected_month_cost": round(projected_month_cost, 2),
-        })
+        out.append(
+            {
+                **row,
+                "unit_rate": round(unit_rate, 6),
+                "standing_charge": round(standing_charge, 6),
+                "daily_cost": round(daily_cost, 4),
+                "projected_month_cost": round(projected_month_cost, 2),
+            }
+        )
     return out
 
 
@@ -189,7 +247,13 @@ st.set_page_config(page_title="FloEn", layout="wide")
 st.title("FloEn")
 st.caption("Personal energy cost tracker with Streamlit-hosted secrets")
 
-required = ["ESB_USERNAME", "ESB_PASSWORD", "ESB_MPRN", "FLOGAS_UNIT_RATE", "FLOGAS_STANDING_CHARGE_DAILY"]
+required = [
+    "ESB_USERNAME",
+    "ESB_PASSWORD",
+    "ESB_MPRN",
+    "FLOGAS_UNIT_RATE",
+    "FLOGAS_STANDING_CHARGE_DAILY",
+]
 missing = [k for k in required if get_secret(k) in (None, "")]
 
 if missing:
@@ -204,29 +268,31 @@ with st.sidebar:
     st.header("Data")
     search_type = st.selectbox("ESB search type", ["intervalkw", "consumption"], index=0)
     fetch_now = st.button("Fetch latest ESB data", type="primary")
+    clear_cache = st.button("Clear fetch cache")
+    if clear_cache:
+        fetch_esb_csv_cached.clear()
+        st.success("Fetch cache cleared.")
+    st.caption("Live ESB fetches are limited to once every 24 hours unless you clear the cache.")
 
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame()
 
 if fetch_now:
     try:
-        with st.spinner("Connecting to ESB and downloading data..."):
-            session = requests.Session()
-            session.headers.update({"User-Agent": get_secret("ESB_USER_AGENT", DEFAULT_USER_AGENT)})
-            csv_text = login_and_download(
-                session,
+        with st.spinner("Loading ESB data..."):
+            csv_text = fetch_esb_csv_cached(
                 get_secret("ESB_USERNAME"),
                 get_secret("ESB_PASSWORD"),
                 get_secret("ESB_MPRN"),
                 search_type,
+                get_secret("ESB_USER_AGENT", DEFAULT_USER_AGENT),
             )
-            session.close()
             records = csv_to_records(csv_text)
             daily_rows = aggregate_daily(records)
             cost_rows = add_costs(daily_rows, unit_rate, standing_charge)
             st.session_state.df = records_to_df(cost_rows)
             st.session_state.raw_count = len(records)
-            st.success("Data fetched successfully.")
+            st.success("Data loaded. Live fetches are limited to once every 24 hours.")
     except Exception as e:
         st.error(f"Fetch failed: {e}")
 
@@ -248,14 +314,20 @@ c3.metric("Average Daily Usage", f"{avg_daily_kwh:.2f} kWh")
 c4.metric("Average Hourly Usage", f"{avg_hourly:.2f} kWh")
 
 tab1, tab2, tab3 = st.tabs(["Costs", "Usage", "Data"])
+
 with tab1:
     st.subheader("Daily Cost Trend")
     st.line_chart(df.set_index("date")["daily_cost"])
-    st.dataframe(df[["date", "kwh", "daily_cost", "projected_month_cost"]], use_container_width=True)
+    st.dataframe(
+        df[["date", "kwh", "daily_cost", "projected_month_cost"]],
+        use_container_width=True,
+    )
+
 with tab2:
     st.subheader("Usage Trend")
     st.line_chart(df.set_index("date")["kwh"])
     st.bar_chart(df.set_index("date")["avg_kwh_per_hour"])
+
 with tab3:
     st.subheader("Processed Data")
     st.dataframe(df, use_container_width=True)
