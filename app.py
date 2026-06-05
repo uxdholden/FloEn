@@ -107,7 +107,7 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
         
         for idx, line in enumerate(lines):
             line_lower = line.lower()
-            if "mprn" in line_lower and any(k in line_lower for k in ["date", "time", "value"]):
+            if "mprn" in line_lower && any(k in line_lower for k in ["date", "time", "value"]):
                 header_idx = idx
                 break
         
@@ -312,6 +312,10 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
     df["hour_float"] = df["reading_at"].dt.hour + df["reading_at"].dt.minute / 60.0
     df["is_weekend"] = df["reading_at"].dt.dayofweek >= 5
     
+    # Identify continuous high active draws (classical Tumble Dryer cycle signature)
+    df["active_prev"] = df["active_kwh"].shift(1).fillna(0.0)
+    df["active_next"] = df["active_kwh"].shift(-1).fillna(0.0)
+    
     for idx, row in df.iterrows():
         active = row["active_kwh"]
         if active <= 0:
@@ -319,13 +323,25 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
             
         hr = row["hour_float"]
         
-        # EV Charging
+        # 1. EV Charging (Overnight high continuous draw)
         if house_profile["has_ev"] and (0.0 <= hr < 6.0) and active > 1.5:
             ev_draw = min(active, 3.7)
             df.at[idx, "app_ev"] = ev_draw
             active -= ev_draw
             
-        # Space & Water Heating
+        # 2. Tumble Dryer Sustained Draw Rule
+        # Tumble dryers draw 2-4kW continuously (approx 1.0 - 2.0 kWh per half hour block)
+        # If we see active block consumption > 0.45 kWh AND its adjacent half-hours are also elevated (>0.40 kWh),
+        # this represents a sustained motor/heating resistive load cycle (Dryers, Washing Machine heaters, Dishwashers).
+        if active > 0:
+            is_sustained_heavy = (active > 0.45) and ((row["active_prev"] > 0.40) or (row["active_next"] > 0.40))
+            is_awake_hours = (7.0 <= hr < 23.0)
+            if is_sustained_heavy and is_awake_hours:
+                dryer_draw = active * 0.85
+                df.at[idx, "app_laundry"] = dryer_draw
+                active -= dryer_draw
+            
+        # 3. Space & Water Heating
         if active > 0:
             is_heating_window = (5.5 <= hr < 8.5) or (23.0 <= hr) or (0.0 <= hr < 2.0)
             if is_heating_window:
@@ -334,7 +350,7 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
                 df.at[idx, "app_heating"] = heat_draw
                 active -= heat_draw
 
-        # Cooking & Kitchen
+        # 4. Cooking & Kitchen
         if active > 0:
             is_cooking_window = (7.0 <= hr < 9.0) or (12.0 <= hr < 14.0) or (16.5 <= hr < 19.5)
             if is_cooking_window:
@@ -343,23 +359,24 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
                 df.at[idx, "app_cooking"] = cooking_draw
                 active -= cooking_draw
 
-        # Wet Appliances (Laundry / Dishwasher)
+        # 5. Standard Wet Chores (Laundry / Dishwasher)
+        # Widened windows to catch evening runs (up to 10 PM) and late morning weekend starts
         if active > 0:
-            is_chore_window = (9.0 <= hr < 12.0) or (14.0 <= hr < 16.5) or (row["is_weekend"] and 10.0 <= hr < 17.0)
+            is_chore_window = (9.0 <= hr < 12.0) or (14.0 <= hr < 16.5) or (19.0 <= hr < 22.0) or (row["is_weekend"] and 9.0 <= hr < 18.0)
             if is_chore_window:
-                laundry_ratio = 0.5 if active > 0.2 else 0.2
+                laundry_ratio = 0.5 if active > 0.2 else 0.25
                 laundry_draw = active * laundry_ratio
-                df.at[idx, "app_laundry"] = laundry_draw
+                df.at[idx, "app_laundry"] += laundry_draw
                 active -= laundry_draw
 
-        # Entertainment & Lighting
+        # 6. Entertainment & Lighting
         if active > 0:
             if 18.0 <= hr < 23.5:
                 ent_draw = active * 0.7
                 df.at[idx, "app_entertainment"] = ent_draw
                 active -= ent_draw
                 
-        # Miscellaneous
+        # 7. Miscellaneous / Unclassified active residuals
         if active > 0:
             df.at[idx, "app_misc"] = active
             
@@ -933,13 +950,15 @@ if df_raw is not None and not df_raw.empty:
             
         with col_a2:
             st.markdown("#### Estimated Bill Contribution")
+            # Sort with high contributor first
+            sorted_app_summary = app_summary.sort_values(by="Estimated Cost (€)", ascending=False)
             fig_app_bar = px.bar(
-                app_summary,
+                sorted_app_summary,
                 x="Appliance Category",
                 y="Estimated Cost (€)",
                 color="Appliance Category",
                 color_discrete_sequence=px.colors.qualitative.Safe,
-                text=app_summary["Estimated Cost (€)"].map(lambda x: f"€{x:.2f}")
+                text=sorted_app_summary["Estimated Cost (€)"].map(lambda x: f"€{x:.2f}")
             )
             fig_app_bar.update_traces(
                 hovertemplate="<b>Category:</b> %{x}<br><b>Bill Portion:</b> €%{y:.2f}<extra></extra>",
