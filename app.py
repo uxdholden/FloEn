@@ -1,383 +1,591 @@
 import io
 import re
-from datetime import date, datetime, timedelta
-
+import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
+# Set page configuration
 st.set_page_config(
-    page_title="My Flogas Dashboard",
+    page_title="Smart Meter Analytics Dashboard",
+    page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
+# --- UTILITY PARSER FUNCTION (Optimized) ---
+def parse_interval_csv(uploaded_file) -> pd.DataFrame:
+    """
+    Parses electricity smart meter interval data files (such as ESB HDF files).
+    Handles files with leading metadata headers, flexible column names, and 
+    both CSV and raw text-copy formats.
+    """
+    if hasattr(uploaded_file, "read"):
+        raw_bytes = uploaded_file.read()
+    else:
+        raw_bytes = uploaded_file
 
-def init_state():
-    if "bills" not in st.session_state:
-        today = date.today()
-        first_of_month = today.replace(day=1)
-        prev_month_anchor = (first_of_month - timedelta(days=1)).replace(day=1)
-        st.session_state.bills = pd.DataFrame(
-            [
-                {
-                    "bill_date": first_of_month,
-                    "due_date": today + timedelta(days=12),
-                    "amount": 124.80,
-                    "status": "Due",
-                    "notes": "Sample current bill",
-                },
-                {
-                    "bill_date": prev_month_anchor,
-                    "due_date": prev_month_anchor + timedelta(days=14),
-                    "amount": 98.40,
-                    "status": "Paid",
-                    "notes": "Sample previous bill",
-                },
-            ]
-        )
-
-    if "meter_readings" not in st.session_state:
-        st.session_state.meter_readings = pd.DataFrame(
-            columns=[
-                "mprn",
-                "meter_serial",
-                "reading_at",
-                "reading_value",
-                "estimated_kwh",
-                "meter_type",
-                "source",
-                "date_only",
-            ]
-        )
-
-    if "reminders" not in st.session_state:
-        st.session_state.reminders = pd.DataFrame(
-            [
-                {
-                    "title": "Submit meter reading",
-                    "due_date": date.today() + timedelta(days=7),
-                    "status": "Open",
-                    "notes": "Avoid estimated bill",
-                },
-                {
-                    "title": "Review latest bill",
-                    "due_date": date.today() + timedelta(days=3),
-                    "status": "Open",
-                    "notes": "Check cost and projected trend",
-                },
-            ]
-        )
-
-
-def parse_interval_csv(uploaded_file):
-    raw = uploaded_file.read().decode("utf-8", errors="ignore")
-    uploaded_file.seek(0)
+    if isinstance(raw_bytes, bytes):
+        raw = raw_bytes.decode("utf-8-sig", errors="ignore")
+    else:
+        raw = str(raw_bytes)
 
     def finalize(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame()
-
-        if "read_value_kw" not in df.columns and "read_value" in df.columns:
-            df["read_value_kw"] = pd.to_numeric(df["read_value"], errors="coerce")
-
+        
+        value_col = "read_value" if "read_value" in df.columns else "read_value_kw"
+        df = df.dropna(subset=["reading_at", value_col]).copy()
+        
+        if "read_value_kw" not in df.columns:
+            df["read_value_kw"] = pd.to_numeric(df[value_col], errors="coerce")
+            
         df["reading_at"] = pd.to_datetime(df["reading_at"], errors="coerce")
-        df = df.dropna(subset=["reading_at", "read_value_kw"]).copy()
+        df = df.dropna(subset=["reading_at", "read_value_kw"]).sort_values("reading_at")
+        
         if df.empty:
             return pd.DataFrame()
-
-        df = df.sort_values("reading_at")
+            
+        is_kwh = df["read_type"].str.contains("kWh", case=False, na=False) if "read_type" in df.columns else True
         df["interval_hours"] = 0.5
-        read_type_series = df.get("read_type", "").astype(str)
-        is_kw = read_type_series.str.contains(r"\(kW\)|\skW$", regex=True, na=False)
-        df["estimated_kwh"] = df["read_value_kw"].where(~is_kw, df["read_value_kw"] * df["interval_hours"])
+        df["estimated_kwh"] = np.where(is_kwh, df["read_value_kw"], df["read_value_kw"] * df["interval_hours"])
+        
         df["date_only"] = df["reading_at"].dt.date
-
+        
         for col in ["mprn", "meter_serial"]:
             if col not in df.columns:
                 df[col] = ""
+                
+        return df[["mprn", "meter_serial", "reading_at", "read_value_kw", "estimated_kwh", "date_only"]]
 
-        df = df.rename(columns={"read_value_kw": "reading_value"})
-        df["meter_type"] = "interval"
-        df["source"] = "upload"
-        return df[
-            [
-                "mprn",
-                "meter_serial",
-                "reading_at",
-                "reading_value",
-                "estimated_kwh",
-                "meter_type",
-                "source",
-                "date_only",
-            ]
-        ]
-
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    headerless = False
-    if lines:
-        first_parts = [part.strip() for part in lines[0].split(",")]
-        headerless = len(first_parts) >= 5 and re.fullmatch(r"\d{11}", first_parts[0] or "") is not None
-
+    # Extract Data using Pandas (CSV Mode)
     try:
-        if headerless:
-            csv_df = pd.read_csv(
-                io.StringIO(raw),
-                header=None,
-                names=["mprn", "meter serial number", "read value", "read type", "read date and end time"],
-            )
-        else:
-            csv_df = pd.read_csv(io.StringIO(raw))
+        lines = raw.splitlines()
+        header_idx = -1
+        required_keywords = ["mprn", "value", "date"]
+        
+        for idx, line in enumerate(lines):
+            line_lower = line.lower()
+            if "mprn" in line_lower and any(k in line_lower for k in ["date", "time", "value"]):
+                header_idx = idx
+                break
+        
+        csv_source = "\n".join(lines[header_idx:]) if header_idx != -1 else raw
+        csv_df = pd.read_csv(io.StringIO(csv_source))
+        
+        cols = {str(col).strip().lower(): col for col in csv_df.columns}
+        
+        mprn_col = next((cols[c] for c in cols if "mprn" in c), None)
+        serial_col = next((cols[c] for c in cols if "serial" in c or "meter" in c), None)
+        value_col = next((cols[c] for c in cols if "value" in c or "reading" in c), None)
+        type_col = next((cols[c] for c in cols if "type" in c), None)
+        date_col = next((cols[c] for c in cols if "date" in c or "time" in c or "at" in c), None)
 
-        normalized = {str(col).strip().lower(): col for col in csv_df.columns}
-        required = ["mprn", "meter serial number", "read value", "read type", "read date and end time"]
-        if all(col in normalized for col in required):
-            df = pd.DataFrame(
-                {
-                    "mprn": csv_df[normalized["mprn"]].astype(str).str.strip(),
-                    "meter_serial": csv_df[normalized["meter serial number"]].astype(str).str.strip(),
-                    "read_value_kw": pd.to_numeric(csv_df[normalized["read value"]], errors="coerce"),
-                    "read_type": csv_df[normalized["read type"]].astype(str).str.strip(),
-                    "reading_at": pd.to_datetime(
-                        csv_df[normalized["read date and end time"]],
-                        format="%d-%m-%Y %H:%M",
-                        errors="coerce",
-                    ),
-                }
-            )
-            df = df[
-                df["read_type"].str.contains(
-                    r"Active Import Interval(?:\s*\((?:kW|kWh)\)|\s+kW|\s+kWh)",
-                    regex=True,
-                    na=False,
-                )
-            ]
+        if all([mprn_col, value_col, date_col]):
+            df = pd.DataFrame({
+                "mprn": csv_df[mprn_col].astype(str).str.strip(),
+                "meter_serial": csv_df[serial_col].astype(str).str.strip() if serial_col else "",
+                "read_value": pd.to_numeric(csv_df[value_col], errors="coerce"),
+                "read_type": csv_df[type_col].astype(str).str.strip() if type_col else "Active Import Interval (kWh)",
+                "reading_at": pd.to_datetime(
+                    csv_df[date_col],
+                    errors="coerce",
+                ),
+            })
+
+            if type_col:
+                df = df[
+                    df["read_type"].str.contains(
+                        r"Active Import Interval\s*(?:\((?:kW|kWh)\))?",
+                        regex=True,
+                        na=False,
+                        case=False
+                    )
+                ]
+
             parsed = finalize(df)
             if not parsed.empty:
                 return parsed
     except Exception:
         pass
 
+    # Fallback Regex Parser
     pattern = re.compile(
-        r"(?P<mprn>\d{11})\s*"
-        r"(?P<serial>\d+)\s*"
-        r"(?P<value>\d+\.\d{3,4})\s*"
-        r"(?P<read_type>Active Import Interval(?:\s*\((?:kW|kWh)\)|\s+kW|\s+kWh))\s*"
-        r"(?P<date>\d{2}-\d{2}-\d{4})\s+"
-        r"(?P<time>\d{2}:?\d{2}|\d{4})"
+        r"(?P<mprn>\d{11})[,\s\t;]+"
+        r"(?P<serial>[A-Za-z0-9_-]+)[,\s\t;]+"
+        r"(?P<value>\d+(?:\.\d+)?)[,\s\t;]+"
+        r"(?P<read_type>Active Import Interval(?:\s*\((?:kW|kWh)\)|\s+kW|\s+kWh))[,\s\t;]+"
+        r"(?P<date>\d{2}[-/]\d{2}[-/]\d{4})[,\s\t ]+"
+        r"(?P<time>\d{2}:?\d{2}(?::?\d{2})?)"
     )
 
     rows = []
-    for match in pattern.finditer(raw):
-        time_text = match.group("time").replace(":", "")
-        rows.append(
-            {
-                "mprn": match.group("mprn"),
-                "meter_serial": match.group("serial"),
-                "read_value_kw": float(match.group("value")),
-                "read_type": match.group("read_type"),
-                "reading_at": pd.to_datetime(
-                    f"{match.group('date')} {time_text}",
-                    format="%d-%m-%Y %H%M",
-                    errors="coerce",
-                ),
-            }
+    for m in pattern.finditer(raw):
+        date_str = m.group("date").replace("/", "-")
+        time_text = m.group("time").replace(":", "")
+        if len(time_text) > 4:
+            time_text = time_text[:4]
+            
+        reading_at = pd.to_datetime(
+            f"{date_str} {time_text}",
+            format="%d-%m-%Y %H%M",
+            errors="coerce",
         )
+        rows.append({
+            "mprn": m.group("mprn"),
+            "meter_serial": m.group("serial"),
+            "read_value_kw": float(m.group("value")),
+            "read_type": m.group("read_type"),
+            "reading_at": reading_at,
+        })
+
+    if not rows:
+        fallback_lines = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if "Active Import" not in line:
+                continue
+            m = re.search(pattern, line)
+            if m:
+                date_str = m.group("date").replace("/", "-")
+                time_text = m.group("time").replace(":", "")
+                if len(time_text) > 4:
+                    time_text = time_text[:4]
+                fallback_lines.append({
+                    "mprn": m.group("mprn"),
+                    "meter_serial": m.group("serial"),
+                    "read_value_kw": float(m.group("value")),
+                    "read_type": m.group("read_type"),
+                    "reading_at": pd.to_datetime(
+                        f"{date_str} {time_text}",
+                        format="%d-%m-%Y %H%M",
+                        errors="coerce",
+                    ),
+                })
+        rows = fallback_lines
 
     if not rows:
         return pd.DataFrame()
+
     return finalize(pd.DataFrame(rows))
 
 
-def add_bill(bill_date, due_date, amount, status, notes):
-    new_row = pd.DataFrame(
-        [{
-            "bill_date": bill_date,
-            "due_date": due_date,
-            "amount": float(amount),
-            "status": status,
-            "notes": notes,
-        }]
+# --- DEMO DATA GENERATOR ---
+def generate_demo_data() -> pd.DataFrame:
+    """Generates synthetic half-hourly smart meter interval data for demo purposes."""
+    np.random.seed(42)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=90)  # ~3 months of data
+    
+    date_range = pd.date_range(start=start_date, end=end_date, freq="30min")
+    
+    rows = []
+    for dt in date_range:
+        hour = dt.hour
+        weekday = dt.weekday()
+        
+        # Base load behavior (refrigerator, standby appliances)
+        base = 0.15 + np.random.normal(0, 0.02)
+        
+        # Activity multipliers
+        if 8 <= hour < 17:  # Daytime work hours
+            activity = 0.25 + np.random.normal(0, 0.05)
+        elif 17 <= hour < 19:  # Peak dinner time
+            activity = 0.85 + np.random.normal(0, 0.15)
+        elif 19 <= hour < 23:  # Evening wind-down
+            activity = 0.45 + np.random.normal(0, 0.08)
+        else:  # Night time sleep
+            activity = 0.05 + np.random.normal(0, 0.01)
+            
+        # Add weekend variation
+        if weekday >= 5:
+            activity *= 1.25
+            
+        # Add kitchen/heating spikes occasionally
+        spike = 1.8 if (hour == 8 or hour == 18) and np.random.rand() > 0.7 else 0.0
+            
+        read_val = max(0.01, base + activity + spike)
+        
+        rows.append({
+            "mprn": "10009998881",
+            "meter_serial": "MET-88392",
+            "reading_at": dt,
+            "read_value_kw": read_val * 2, # Convert kWh consumption back to kW demand
+            "estimated_kwh": read_val,
+            "date_only": dt.date()
+        })
+        
+    return pd.DataFrame(rows)
+
+
+# --- DYNAMIC COST CALCULATION ---
+def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
+    """
+    Applies custom tariff bands to each reading based on the time of day.
+    Standard Smart Meter Tariff structure (Day / Night / Peak):
+      - Night: 23:00 - 08:00
+      - Peak: 17:00 - 19:00
+      - Day: 08:00 - 17:00 and 19:00 - 23:00
+    """
+    df = df.copy()
+    df["hour"] = df["reading_at"].dt.hour
+    
+    # Assign Tariff Categories
+    conditions = [
+        (df["hour"] >= 23) | (df["hour"] < 8),                     # Night (11 PM - 8 AM)
+        (df["hour"] >= 17) & (df["hour"] < 19),                     # Peak (5 PM - 7 PM)
+    ]
+    choices = ["Night", "Peak"]
+    df["tariff_band"] = np.select(conditions, choices, default="Day")
+    
+    # Map rates to bands
+    rate_map = {
+        "Day": rates["day_rate"],
+        "Night": rates["night_rate"],
+        "Peak": rates["peak_rate"]
+    }
+    df["tariff_rate"] = df["tariff_band"].map(rate_map)
+    df["cost"] = df["estimated_kwh"] * df["tariff_rate"]
+    
+    return df
+
+
+# --- STREAMLIT UI LAYOUT ---
+
+st.title("⚡ Smart Meter Analytics & Cost Dashboard")
+st.markdown("Upload your utility smart meter interval export (HDF files, CSVs, or text captures) to analyze usage and model costs.")
+
+# --- SIDEBAR CONTROLS ---
+st.sidebar.header("📁 Data Source")
+data_option = st.sidebar.radio("Choose Data Input:", ["Use Sample Demo Data", "Upload My Own File"])
+
+uploaded_file = None
+if data_option == "Upload My Own File":
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload Smart Meter File (CSV or TXT)", 
+        type=["csv", "txt"],
+        help="Supports standard Smart Meter HDF CSVs (with leading metadata or plain table structures)"
     )
-    st.session_state.bills = pd.concat([st.session_state.bills, new_row], ignore_index=True)
 
+# --- TARIFF / COST SIDEBAR ---
+st.sidebar.header("💰 Tariff Settings (€)")
+rates = {
+    "day_rate": st.sidebar.number_input("Day Rate (€/kWh)", min_value=0.0, max_value=2.0, value=0.38, step=0.01, format="%.3f"),
+    "night_rate": st.sidebar.number_input("Night Rate (€/kWh)", min_value=0.0, max_value=2.0, value=0.20, step=0.01, format="%.3f"),
+    "peak_rate": st.sidebar.number_input("Peak Rate (€/kWh)", min_value=0.0, max_value=2.0, value=0.46, step=0.01, format="%.3f"),
+    "standing_charge": st.sidebar.number_input("Daily Standing Charge (€/day)", min_value=0.0, max_value=10.0, value=0.85, step=0.05),
+    "vat_rate": st.sidebar.number_input("VAT Rate (%)", min_value=0.0, max_value=100.0, value=9.0, step=0.5) / 100.0
+}
 
-def add_reminder(title, due_date, status, notes):
-    new_row = pd.DataFrame(
-        [{
-            "title": title,
-            "due_date": due_date,
-            "status": status,
-            "notes": notes,
-        }]
-    )
-    st.session_state.reminders = pd.concat([st.session_state.reminders, new_row], ignore_index=True)
-
-
-def safe_dates(df, cols):
-    out = df.copy()
-    for col in cols:
-        if col in out.columns:
-            out[col] = pd.to_datetime(out[col], errors="coerce")
-    return out
-
-
-def render_overview():
-    bills = safe_dates(st.session_state.bills, ["bill_date", "due_date"])
-    readings = safe_dates(st.session_state.meter_readings, ["reading_at"])
-    reminders = safe_dates(st.session_state.reminders, ["due_date"])
-
-    total_bills = float(bills["amount"].sum()) if not bills.empty else 0.0
-    latest_bill = float(bills.sort_values("bill_date")["amount"].iloc[-1]) if not bills.empty else 0.0
-    total_kwh = float(readings["estimated_kwh"].sum()) if not readings.empty else 0.0
-    open_reminders = int((reminders["status"].astype(str).str.lower() == "open").sum()) if not reminders.empty else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Bills total", f"€{total_bills:,.2f}")
-    c2.metric("Latest bill", f"€{latest_bill:,.2f}")
-    c3.metric("Imported usage", f"{total_kwh:,.1f} kWh")
-    c4.metric("Open reminders", open_reminders)
-
-    left, right = st.columns([1.2, 1])
-
-    with left:
-        st.subheader("Recent bills")
-        display_bills = bills.sort_values("bill_date", ascending=False).copy()
-        if not display_bills.empty:
-            display_bills["bill_date"] = display_bills["bill_date"].dt.date
-            display_bills["due_date"] = display_bills["due_date"].dt.date
-            st.dataframe(display_bills, use_container_width=True, hide_index=True)
+# --- LOAD DATA ---
+df_raw = None
+if data_option == "Upload My Own File" and uploaded_file is not None:
+    with st.spinner("Processing your smart meter file..."):
+        df_raw = parse_interval_csv(uploaded_file)
+        if df_raw.empty:
+            st.error("Failed to parse the file. Please check if the file format matches an interval-based CSV/TXT, or use our Sample Demo Data.")
         else:
-            st.info("No bills added yet.")
+            st.success("Successfully parsed uploaded file!")
+elif data_option == "Use Sample Demo Data":
+    df_raw = generate_demo_data()
+    st.info("💡 Displaying mock analytical data. Switch the data source in the sidebar to visualize your own smart meter profile!")
 
-    with right:
-        st.subheader("Usage trend")
-        if not readings.empty:
-            usage = readings.copy()
-            usage["date_only"] = pd.to_datetime(usage["reading_at"]).dt.date
-            daily = usage.groupby("date_only", as_index=False)["estimated_kwh"].sum()
-            daily = daily.rename(columns={"date_only": "date", "estimated_kwh": "kWh"})
-            st.line_chart(daily.set_index("date"))
-        else:
-            st.info("Upload an interval CSV to see usage.")
+# --- DISPLAY DASHBOARD ---
+if df_raw is not None and not df_raw.empty:
+    # 1. Apply costs & extract datetime characteristics
+    df = apply_tariffs(df_raw, rates)
+    df["reading_at"] = pd.to_datetime(df["reading_at"])
+    df["year_month"] = df["reading_at"].dt.strftime("%Y-%m")
+    df["day_name"] = df["reading_at"].dt.day_name()
+    df["hour_of_day"] = df["reading_at"].dt.hour
+    
+    # Aggregate Standing Charge Costs
+    unique_days = df["date_only"].nunique()
+    total_standing_charge = unique_days * rates["standing_charge"]
+    
+    # 2. Key Metrics Calculations
+    total_kwh = df["estimated_kwh"].sum()
+    usage_cost = df["cost"].sum()
+    gross_cost = (usage_cost + total_standing_charge) * (1 + rates["vat_rate"])
+    
+    max_demand_row = df.loc[df["read_value_kw"].idxmax()]
+    max_demand_kw = max_demand_row["read_value_kw"]
+    max_demand_time = max_demand_row["reading_at"].strftime("%d %b %H:%M")
+    
+    avg_daily_kwh = total_kwh / unique_days
+    avg_daily_cost = gross_cost / unique_days
 
+    # Layout: Top Key KPI Cards
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(
+            label="Total Consumption", 
+            value=f"{total_kwh:,.1f} kWh", 
+            help="Sum of all interval energy usage during the logged period."
+        )
+    with col2:
+        st.metric(
+            label="Total Cost (Inc. VAT & Standing)", 
+            value=f"€{gross_cost:,.2f}", 
+            help=f"Includes usage charges, standing charges (€{total_standing_charge:.2f}), and VAT ({rates['vat_rate']*100:.1f}%)."
+        )
+    with col3:
+        st.metric(
+            label="Average Daily Cost", 
+            value=f"€{avg_daily_cost:.2f}/day",
+            help="Total calculated cost divided by number of unique days tracked."
+        )
+    with col4:
+        st.metric(
+            label="Peak Power Demand", 
+            value=f"{max_demand_kw:.2f} kW", 
+            delta=f"at {max_demand_time}",
+            delta_color="off"
+        )
+    
+    st.markdown("---")
+    
+    # TAB VIEW FOR SECTIONS
+    tab1, tab2, tab3 = st.tabs(["📊 Monthly & Cost Projections", "⏰ Hourly & Peak Analysis", "📅 Daily Patterns & Heatmaps"])
+    
+    # --- TAB 1: MONTHLY & PROJECTIONS ---
+    with tab1:
+        st.subheader("Monthly Usage, Actual Costs & Projections")
+        
+        # Monthly grouping
+        monthly_summary = df.groupby("year_month").agg(
+            total_kwh=("estimated_kwh", "sum"),
+            usage_cost=("cost", "sum"),
+            days_in_dataset=("date_only", "nunique")
+        ).reset_index()
+        
+        # Calculate standing charges and VAT per month
+        monthly_summary["standing_charges"] = monthly_summary["days_in_dataset"] * rates["standing_charge"]
+        monthly_summary["total_cost_inc_vat"] = (monthly_summary["usage_cost"] + monthly_summary["standing_charges"]) * (1 + rates["vat_rate"])
+        
+        # Current month projections logic
+        current_year_month = datetime.now().strftime("%Y-%m")
+        has_current_month = current_year_month in monthly_summary["year_month"].values
+        
+        projections_list = []
+        for index, row in monthly_summary.iterrows():
+            is_current = row["year_month"] == current_year_month
+            days_tracked = row["days_in_dataset"]
+            
+            # Estimate remaining days in month
+            year, month = map(int, row["year_month"].split("-"))
+            if month == 12:
+                next_month = datetime(year + 1, 1, 1)
+            else:
+                next_month = datetime(year, month + 1, 1)
+            total_days_in_month = (next_month - datetime(year, month, 1)).days
+            
+            if is_current and days_tracked < total_days_in_month:
+                # Extrapolate for remaining days
+                avg_kwh_per_day = row["total_kwh"] / days_tracked
+                avg_cost_per_day = row["total_cost_inc_vat"] / days_tracked
+                
+                projected_kwh = avg_kwh_per_day * total_days_in_month
+                projected_cost = avg_cost_per_day * total_days_in_month
+                
+                projections_list.append({
+                    "Month": row["year_month"],
+                    "Status": "Projected (Full Month)",
+                    "Consumption (kWh)": projected_kwh,
+                    "Total Cost (€)": projected_cost
+                })
+                # Add actual-to-date entry
+                projections_list.append({
+                    "Month": row["year_month"],
+                    "Status": "Actual (To-Date)",
+                    "Consumption (kWh)": row["total_kwh"],
+                    "Total Cost (€)": row["total_cost_inc_vat"]
+                })
+            else:
+                projections_list.append({
+                    "Month": row["year_month"],
+                    "Status": "Actual (Complete)",
+                    "Consumption (kWh)": row["total_kwh"],
+                    "Total Cost (€)": row["total_cost_inc_vat"]
+                })
+                
+        proj_df = pd.DataFrame(projections_list)
+        
+        # Render charts for Monthly
+        m_col1, m_col2 = st.columns(2)
+        
+        with m_col1:
+            st.markdown("#### Monthly Consumption (kWh)")
+            fig_month_kwh = px.bar(
+                proj_df, 
+                x="Month", 
+                y="Consumption (kWh)", 
+                color="Status",
+                barmode="group",
+                color_discrete_map={
+                    "Actual (Complete)": "#1E88E5",
+                    "Actual (To-Date)": "#1565C0",
+                    "Projected (Full Month)": "#90CAF9"
+                },
+                text_auto=".0f"
+            )
+            fig_month_kwh.update_layout(xaxis_title="Month", yaxis_title="kWh Used", legend_title="Usage Category")
+            st.plotly_chart(fig_month_kwh, use_container_width=True)
+            
+        with m_col2:
+            st.markdown("#### Monthly Cost (€)")
+            fig_month_cost = px.bar(
+                proj_df, 
+                x="Month", 
+                y="Total Cost (€)", 
+                color="Status",
+                barmode="group",
+                color_discrete_map={
+                    "Actual (Complete)": "#2E7D32",
+                    "Actual (To-Date)": "#1B5E20",
+                    "Projected (Full Month)": "#A5D6A7"
+                },
+                text_auto=".2f"
+            )
+            fig_month_cost.update_layout(xaxis_title="Month", yaxis_title="Total Bill (€)", legend_title="Cost Status")
+            st.plotly_chart(fig_month_cost, use_container_width=True)
+            
+        # Explanatory projection text card
+        if has_current_month:
+            this_month_proj = proj_df[(proj_df["Month"] == current_year_month) & (proj_df["Status"] == "Projected (Full Month)")]
+            this_month_act = proj_df[(proj_df["Month"] == current_year_month) & (proj_df["Status"] == "Actual (To-Date)")]
+            
+            if not this_month_proj.empty and not this_month_act.empty:
+                proj_val = this_month_proj["Total Cost (€)"].values[0]
+                act_val = this_month_act["Total Cost (€)"].values[0]
+                days_elapsed = monthly_summary[monthly_summary["year_month"] == current_year_month]["days_in_dataset"].values[0]
+                
+                st.info(
+                    f"🔮 **Current Month Projection ({current_year_month}):** Based on the first **{days_elapsed} days** of this month, "
+                    f"your actual usage cost so far is **€{act_val:.2f}**. "
+                    f"At your current rate of consumption, we project your final bill for this month to reach **€{proj_val:.2f}**."
+                )
 
-def render_bills():
-    st.subheader("Bills")
+    # --- TAB 2: HOURLY & PEAK ANALYSIS ---
+    with tab2:
+        st.subheader("Usage Profile by Hour of Day & Weekday")
+        
+        # Diurnal (hourly) usage profile
+        hourly_summary = df.groupby(["hour_of_day", "tariff_band"]).agg(
+            avg_kwh=("estimated_kwh", "mean"),
+            total_kwh=("estimated_kwh", "sum")
+        ).reset_index()
+        
+        # Weekday vs Weekend Average profile
+        df["day_type"] = np.where(df["reading_at"].dt.dayofweek < 5, "Weekday", "Weekend")
+        hourly_daytype_summary = df.groupby(["hour_of_day", "day_type"]).agg(
+            avg_kwh=("estimated_kwh", "mean")
+        ).reset_index()
+        
+        h_col1, h_col2 = st.columns(2)
+        
+        with h_col1:
+            st.markdown("#### Average Energy Profile by Hour of Day")
+            fig_hourly = px.line(
+                hourly_daytype_summary, 
+                x="hour_of_day", 
+                y="avg_kwh", 
+                color="day_type",
+                markers=True,
+                color_discrete_sequence=["#FF7043", "#26A69A"]
+            )
+            fig_hourly.update_layout(
+                xaxis=dict(tickmode="linear", tick0=0, dtick=2),
+                xaxis_title="Hour of Day (24h)",
+                yaxis_title="Average Usage (kWh)",
+                legend_title="Day Type"
+            )
+            st.plotly_chart(fig_hourly, use_container_width=True)
+            
+        with h_col2:
+            st.markdown("#### Cost Impact by Tariff Band")
+            tariff_breakdown = df.groupby("tariff_band").agg(
+                total_kwh=("estimated_kwh", "sum"),
+                total_cost=("cost", "sum")
+            ).reset_index()
+            
+            fig_pie = px.pie(
+                tariff_breakdown, 
+                values="total_kwh", 
+                names="tariff_band",
+                color="tariff_band",
+                color_discrete_map={"Day": "#FFCA28", "Night": "#5C6BC0", "Peak": "#EF5350"},
+                hole=0.4
+            )
+            fig_pie.update_traces(textinfo="percent+label")
+            fig_pie.update_layout(legend_title="Tariff Category")
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+        st.markdown("---")
+        st.markdown("#### ⚡ Peak Usage Diagnostics")
+        p_col1, p_col2 = st.columns(2)
+        
+        with p_col1:
+            # Highlight Peak bands
+            peak_only = df[df["tariff_band"] == "Peak"]
+            avg_peak_load = peak_only["read_value_kw"].mean()
+            st.markdown(
+                f"""
+                * **Peak Period (17:00 - 19:00):** Your average demand during evening peak window is **{avg_peak_load:.2f} kW**.
+                * **Day/Night Load Shift Potential:** Shifting appliances (washing machine, dishwasher, EV charging) from Peak/Day slots to **Night ({rates['night_rate']:.3f}€/kWh)** or **Day ({rates['day_rate']:.3f}€/kWh)** will substantially drop your monthly bills.
+                """
+            )
+            
+        with p_col2:
+            # Show highest peak usage days
+            top_peaks = df.sort_values(by="read_value_kw", ascending=False).head(5)
+            st.markdown("**Top 5 Single Highest Appliance Spikes Recorded:**")
+            for _, r in top_peaks.iterrows():
+                st.write(f"- 🔴 **{r['read_value_kw']:.2f} kW** on {r['reading_at'].strftime('%A, %d %b %Y at %H:%M')}")
 
-    with st.form("bill_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        bill_date = c1.date_input("Bill date", value=date.today())
-        due_date = c2.date_input("Due date", value=date.today() + timedelta(days=14))
-        c3, c4 = st.columns(2)
-        amount = c3.number_input("Amount (€)", min_value=0.0, step=0.01, value=0.0)
-        status = c4.selectbox("Status", ["Due", "Paid", "Overdue"])
-        notes = st.text_input("Notes")
-        submitted = st.form_submit_button("Add bill")
-        if submitted:
-            add_bill(bill_date, due_date, amount, status, notes)
-            st.success("Bill added.")
+    # --- TAB 3: DAILY PATTERNS & HEATMAPS ---
+    with tab3:
+        st.subheader("Daily Trends and Heatmap Distribution")
+        
+        # Line plot of daily usage
+        daily_kwh = df.groupby("date_only").agg(
+            total_kwh=("estimated_kwh", "sum"),
+            cost_inc_standing=("cost", lambda x: (x.sum() + rates["standing_charge"]) * (1 + rates["vat_rate"]))
+        ).reset_index()
+        
+        fig_daily = px.area(
+            daily_kwh, 
+            x="date_only", 
+            y="total_kwh", 
+            line_shape="spline",
+            color_discrete_sequence=["#26A69A"]
+        )
+        fig_daily.update_layout(
+            xaxis_title="Date",
+            yaxis_title="Daily Consumption (kWh)",
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig_daily, use_container_width=True)
+        
+        # 2D Heatmap of hour vs day of week
+        st.markdown("#### Hourly vs Day-of-Week Intensity Heatmap")
+        heatmap_data = df.groupby(["day_name", "hour_of_day"])["estimated_kwh"].mean().reset_index()
+        
+        # Sort days correctly
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        heatmap_pivot = heatmap_data.pivot(index="day_name", columns="hour_of_day", values="estimated_kwh").reindex(day_order)
+        
+        fig_heatmap = px.imshow(
+            heatmap_pivot,
+            labels=dict(x="Hour of Day", y="Day of Week", color="Avg kWh"),
+            x=list(range(24)),
+            y=day_order,
+            color_continuous_scale="Viridis"
+        )
+        fig_heatmap.update_layout(xaxis=dict(tickmode="linear", tick0=0, dtick=1))
+        st.plotly_chart(fig_heatmap, use_container_width=True)
 
-    bills = safe_dates(st.session_state.bills, ["bill_date", "due_date"])
-    if not bills.empty:
-        bills = bills.sort_values("bill_date", ascending=False).copy()
-        bills["bill_date"] = bills["bill_date"].dt.date
-        bills["due_date"] = bills["due_date"].dt.date
-        st.dataframe(bills, use_container_width=True, hide_index=True)
-    else:
-        st.info("No bills available.")
-
-
-def render_readings():
-    st.subheader("Meter readings")
-
-    uploaded = st.file_uploader("Upload meter CSV", type=["csv"], key="main_upload")
-    if uploaded is not None:
-        parsed = parse_interval_csv(uploaded)
-        if parsed.empty:
-            st.error("Could not parse that file.")
-        else:
-            existing = st.session_state.meter_readings.copy()
-            merged = pd.concat([existing, parsed], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["reading_at", "reading_value", "meter_serial"], keep="last")
-            st.session_state.meter_readings = merged.sort_values("reading_at").reset_index(drop=True)
-            st.success(f"Imported {len(parsed)} rows.")
-
-    readings = safe_dates(st.session_state.meter_readings, ["reading_at"])
-    if not readings.empty:
-        r1, r2 = st.columns([1.2, 1])
-        with r1:
-            show = readings.sort_values("reading_at", ascending=False).copy()
-            show["reading_at"] = show["reading_at"].dt.strftime("%Y-%m-%d %H:%M")
-            st.dataframe(show, use_container_width=True, hide_index=True)
-        with r2:
-            daily = readings.copy()
-            daily["date_only"] = pd.to_datetime(daily["reading_at"]).dt.date
-            daily = daily.groupby("date_only", as_index=False)["estimated_kwh"].sum()
-            daily = daily.rename(columns={"date_only": "date", "estimated_kwh": "kWh"})
-            st.bar_chart(daily.set_index("date"))
-    else:
-        st.info("No meter readings imported yet.")
-
-
-def render_reminders():
-    st.subheader("Reminders")
-
-    with st.form("reminder_form", clear_on_submit=True):
-        title = st.text_input("Reminder title")
-        due_date = st.date_input("Due date", value=date.today() + timedelta(days=7), key="rem_due")
-        status = st.selectbox("Status", ["Open", "Done", "Snoozed"], key="rem_status")
-        notes = st.text_input("Notes", key="rem_notes")
-        submitted = st.form_submit_button("Add reminder")
-        if submitted and title.strip():
-            add_reminder(title.strip(), due_date, status, notes)
-            st.success("Reminder added.")
-
-    reminders = safe_dates(st.session_state.reminders, ["due_date"])
-    if not reminders.empty:
-        reminders = reminders.sort_values("due_date", ascending=True).copy()
-        reminders["due_date"] = reminders["due_date"].dt.date
-        st.dataframe(reminders, use_container_width=True, hide_index=True)
-    else:
-        st.info("No reminders available.")
-
-
-def main():
-    init_state()
-
-    st.title("My Flogas Dashboard")
-    st.caption("A simple bill, usage, and reminder tracker that runs without a database.")
-
-    st.sidebar.header("Navigation")
-    page = st.sidebar.radio("Go to", ["Overview", "Bills", "Meter readings", "Reminders"])
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Quick upload")
-    quick_upload = st.sidebar.file_uploader("Upload interval CSV", type=["csv"], key="sidebar_upload")
-    if quick_upload is not None:
-        parsed = parse_interval_csv(quick_upload)
-        if parsed.empty:
-            st.sidebar.error("Could not parse that CSV.")
-        else:
-            existing = st.session_state.meter_readings.copy()
-            merged = pd.concat([existing, parsed], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["reading_at", "reading_value", "meter_serial"], keep="last")
-            st.session_state.meter_readings = merged.sort_values("reading_at").reset_index(drop=True)
-            st.sidebar.success(f"Imported {len(parsed)} rows")
-
-    st.sidebar.markdown("---")
-    st.sidebar.write(f"Bills: {len(st.session_state.bills)}")
-    st.sidebar.write(f"Readings: {len(st.session_state.meter_readings)}")
-    st.sidebar.write(f"Reminders: {len(st.session_state.reminders)}")
-
-    if page == "Overview":
-        render_overview()
-    elif page == "Bills":
-        render_bills()
-    elif page == "Meter readings":
-        render_readings()
-    else:
-        render_reminders()
-
-
-if __name__ == "__main__":
-    main()
+else:
+    st.warning("Please upload a valid smart meter interval data file or select 'Use Sample Demo Data' in the sidebar to populate the dashboard!")
