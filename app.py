@@ -1,5 +1,7 @@
 import io
+import os
 import re
+import calendar
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -9,13 +11,50 @@ from datetime import datetime, timedelta
 
 # Set page configuration
 st.set_page_config(
-    page_title="Smart Meter Analytics Dashboard",
+    page_title="Smart Meter Cost & Analytics Dashboard",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- UTILITY PARSER FUNCTION (Optimized) ---
+# --- INJECT CUSTOM LARGE CARD STYLE CSS ---
+st.markdown("""
+<style>
+    .metric-container {
+        background-color: #f8f9fa;
+        border-radius: 12px;
+        padding: 20px;
+        border: 1px solid #e9ecef;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        text-align: center;
+    }
+    .metric-value {
+        font-size: 2rem;
+        font-weight: 700;
+        margin-bottom: 5px;
+    }
+    .metric-label {
+        font-size: 0.9rem;
+        color: #6c757d;
+        font-weight: 500;
+    }
+    .metric-badge {
+        display: inline-block;
+        padding: 4px 8px;
+        font-size: 0.75rem;
+        font-weight: 700;
+        border-radius: 20px;
+        margin-top: 8px;
+    }
+    .badge-actual { background-color: #e3f2fd; color: #0d47a1; }
+    .badge-projected { background-color: #efebe9; color: #4e342e; }
+    .badge-warning { background-color: #fff3e0; color: #e65100; }
+    .badge-success { background-color: #e8f5e9; color: #1b5e20; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# --- UTILITY PARSER FUNCTION ---
 def parse_interval_csv(uploaded_file) -> pd.DataFrame:
     """
     Parses electricity smart meter interval data files (such as ESB HDF files).
@@ -114,7 +153,7 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
     # Fallback Regex Parser
     pattern = re.compile(
         r"(?P<mprn>\d{11})[,\s\t;]+"
-        r"(?P<serial>[A-Za-z0-9_-]+)[,\s\t;]+"
+        r"(?P<serial>[A-Za-0-9_-]+)[,\s\t;]+"
         r"(?P<value>\d+(?:\.\d+)?)[,\s\t;]+"
         r"(?P<read_type>Active Import Interval(?:\s*\((?:kW|kWh)\)|\s+kW|\s+kWh))[,\s\t;]+"
         r"(?P<date>\d{2}[-/]\d{2}[-/]\d{4})[,\s\t ]+"
@@ -212,7 +251,7 @@ def generate_demo_data() -> pd.DataFrame:
             "mprn": "10303339574",
             "meter_serial": "000000000024049722",
             "reading_at": dt,
-            "read_value_kw": read_val * 2, # Convert kWh consumption back to kW demand
+            "read_value_kw": read_val * 2, 
             "estimated_kwh": read_val,
             "date_only": dt.date()
         })
@@ -233,7 +272,6 @@ def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
         df["tariff_band"] = "24hr Flat"
         df["tariff_rate"] = rates["flat_rate"]
     else:
-        # Assign Smart Tariff Categories
         conditions = [
             (df["hour"] >= 23) | (df["hour"] < 8),                     # Night (11 PM - 8 AM)
             (df["hour"] >= 17) & (df["hour"] < 19),                     # Peak (5 PM - 7 PM)
@@ -241,7 +279,6 @@ def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
         choices = ["Night", "Peak"]
         df["tariff_band"] = np.select(conditions, choices, default="Day")
         
-        # Map rates to bands
         rate_map = {
             "Day": rates["day_rate"],
             "Night": rates["night_rate"],
@@ -255,17 +292,10 @@ def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
 
 # --- HEURISTIC APPLIANCE DISAGGREGATION ENGINE ---
 def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFrame:
-    """
-    Uses NILM-style baseline subtraction and rules-based heuristic models
-    to disaggregate total half-hourly kWh usage into common household appliance groups.
-    """
     df = df.copy()
     
-    # 1. Identify daily baseline (Always On/Standby load)
-    # Group by date and find the minimum 30-min window consumption as the baseload power signature
+    # Identify daily baseline (Always On/Standby load)
     daily_min = df.groupby("date_only")["estimated_kwh"].transform("min")
-    
-    # Always On: Runs continuously. We cap always-on at a reasonable 0.25 kWh per 30 mins (500W continuous)
     df["app_always_on"] = np.minimum(daily_min, 0.25)
     
     # Remaining active consumption to disaggregate
@@ -279,7 +309,6 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
     df["app_entertainment"] = 0.0
     df["app_misc"] = 0.0
     
-    # Helper time flags
     df["hour_float"] = df["reading_at"].dt.hour + df["reading_at"].dt.minute / 60.0
     df["is_weekend"] = df["reading_at"].dt.dayofweek >= 5
     
@@ -290,16 +319,13 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
             
         hr = row["hour_float"]
         
-        # A. ELECTRIC VEHICLE (EV) CHARGING
-        # Standard home chargers pull 7.4 kW (which is ~3.7 kWh per 30 mins)
-        # Usually runs overnight (e.g., midnight to 6 AM)
+        # EV Charging
         if house_profile["has_ev"] and (0.0 <= hr < 6.0) and active > 1.5:
-            ev_draw = min(active, 3.7) # Cap at typical EV charger max output per half hour
+            ev_draw = min(active, 3.7)
             df.at[idx, "app_ev"] = ev_draw
             active -= ev_draw
             
-        # B. SPACE & WATER HEATING
-        # High-power thermal draws in the morning (5:30 - 8:30) or night-boost (23:00 - 2:00)
+        # Space & Water Heating
         if active > 0:
             is_heating_window = (5.5 <= hr < 8.5) or (23.0 <= hr) or (0.0 <= hr < 2.0)
             if is_heating_window:
@@ -308,20 +334,16 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
                 df.at[idx, "app_heating"] = heat_draw
                 active -= heat_draw
 
-        # C. COOKING & KITCHEN APPLIANCES
-        # Confined to traditional meal prep windows: Breakfast (7:00-9:00), Lunch (12:00-14:00), Dinner (16:30-19:30)
+        # Cooking & Kitchen
         if active > 0:
             is_cooking_window = (7.0 <= hr < 9.0) or (12.0 <= hr < 14.0) or (16.5 <= hr < 19.5)
             if is_cooking_window:
-                # Cooking involves short, sharp surges (kettles, hob, oven)
                 cooking_ratio = 0.55 if active > 0.15 else 0.3
                 cooking_draw = active * cooking_ratio
                 df.at[idx, "app_cooking"] = cooking_draw
                 active -= cooking_draw
 
-        # D. WET APPLIANCES (Laundry / Dishwasher)
-        # Typically run during morning chores (9:00-12:00), afternoon slots (14:00-16:30), or weekends.
-        # Marked by moderate continuous draws.
+        # Wet Appliances (Laundry / Dishwasher)
         if active > 0:
             is_chore_window = (9.0 <= hr < 12.0) or (14.0 <= hr < 16.5) or (row["is_weekend"] and 10.0 <= hr < 17.0)
             if is_chore_window:
@@ -330,15 +352,14 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
                 df.at[idx, "app_laundry"] = laundry_draw
                 active -= laundry_draw
 
-        # E. ENTERTAINMENT & LIGHTING
-        # Active evenings awake times (18:00 - 23:30)
+        # Entertainment & Lighting
         if active > 0:
             if 18.0 <= hr < 23.5:
                 ent_draw = active * 0.7
                 df.at[idx, "app_entertainment"] = ent_draw
                 active -= ent_draw
                 
-        # F. MISCELLANEOUS (unallocated active loads)
+        # Miscellaneous
         if active > 0:
             df.at[idx, "app_misc"] = active
             
@@ -346,23 +367,28 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
 
 
 # --- STREAMLIT UI LAYOUT ---
-
 st.title("⚡ Smart Meter Analytics & Cost Dashboard")
-st.markdown("Upload your utility smart meter interval export (HDF files, CSVs, or text captures) to analyze usage and model costs.")
+st.markdown("Replicating Electric Ireland's behavioral heuristics, cost forecasting, and smart appliance profiling.")
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("📁 Data Source")
-data_option = st.sidebar.radio("Choose Data Input:", ["Use Sample Demo Data", "Upload My Own File"])
+
+# Attempt to autoload user's real file if it is in the directory
+local_user_file = "HDF_calckWh_10303339574_05-06-2026.csv"
+if os.path.exists(local_user_file):
+    data_option = st.sidebar.radio("Choose Data Input:", ["Use My Uploaded Smart Meter File", "Use Sample Demo Data"])
+else:
+    data_option = st.sidebar.radio("Choose Data Input:", ["Use Sample Demo Data", "Upload My Own File"])
 
 uploaded_file = None
 if data_option == "Upload My Own File":
     uploaded_file = st.sidebar.file_uploader(
         "Upload Smart Meter File (CSV or TXT)", 
         type=["csv", "txt"],
-        help="Supports standard Smart Meter HDF CSVs (with leading metadata or plain table structures)"
+        help="Upload standard ESB Smart Meter HDF files"
     )
 
-# --- TARIFF / COST SIDEBAR ---
+# --- TARIFF / COST SIDEBAR (POPULATED WITH USER'S REAL PRICES) ---
 st.sidebar.header("💰 Tariff Settings")
 
 tariff_style = st.sidebar.selectbox(
@@ -378,38 +404,38 @@ if tariff_style == "24-Hour Flat Tariff":
         "Flat Rate (Cent / kWh)", 
         min_value=0.0, 
         max_value=200.0, 
-        value=26.41, 
-        step=0.1, 
+        value=26.41, # User's actual rate
+        step=0.01, 
         format="%.2f",
-        help="Your flat electricity usage unit fee. Converts automatically to Euros."
+        help="Your flat electricity rate. Entered in cents, automatically calculated in Euros."
     )
     rates["flat_rate"] = flat_rate_cent / 100.0  # Convert Cent to Euro
 else:
     rates["type"] = "smart"
-    day_rate_cent = st.sidebar.number_input("Day Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=38.00, step=0.1, format="%.2f")
-    night_rate_cent = st.sidebar.number_input("Night Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=20.00, step=0.1, format="%.2f")
-    peak_rate_cent = st.sidebar.number_input("Peak Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=46.00, step=0.1, format="%.2f")
+    day_rate_cent = st.sidebar.number_input("Day Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=28.20, step=0.01, format="%.2f")
+    night_rate_cent = st.sidebar.number_input("Night Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=15.10, step=0.01, format="%.2f")
+    peak_rate_cent = st.sidebar.number_input("Peak Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=35.40, step=0.01, format="%.2f")
     
     rates["day_rate"] = day_rate_cent / 100.0
     rates["night_rate"] = night_rate_cent / 100.0
     rates["peak_rate"] = peak_rate_cent / 100.0
 
-# Fixed Standing and PSO Charges
+# User's exact Fixed standing charges & PSO Levy
 st.sidebar.markdown("**Fixed & Standing Charges (€)**")
 annual_standing = st.sidebar.number_input(
     "Annual Standing Charge (€)", 
     min_value=0.0, 
     max_value=1000.0, 
-    value=270.45, 
-    step=1.0,
-    help="Your annual fixed provider fee. E.g., €270.45"
+    value=270.45, # User's actual rate
+    step=0.01,
+    help="Your annual fixed provider standing charge. E.g., €270.45"
 )
 annual_pso = st.sidebar.number_input(
     "Annual PSO Levy (€)", 
     min_value=0.0, 
     max_value=200.0, 
-    value=19.10, 
-    step=0.5,
+    value=19.10, # User's actual rate
+    step=0.01,
     help="Your annual Public Service Obligation levy fee. E.g., €19.10"
 )
 vat_rate = st.sidebar.number_input(
@@ -425,30 +451,32 @@ daily_standing_rate = (annual_standing + annual_pso) / 365.25
 rates["daily_standing_charge"] = daily_standing_rate
 rates["vat_rate"] = vat_rate
 
-
 # --- APPLIANCE DISAGGREGATION PROFILE SURVEY ---
 st.sidebar.markdown("---")
 st.sidebar.header("🔌 Household Profile Survey")
-st.sidebar.info("Fill out your appliance survey below to map statistical patterns to specific category groups, similar to Electric Ireland's portal.")
+st.sidebar.info("Update these settings to shift the disaggregation weights on the 'Appliance Breakdown' tab.")
 
 house_profile = {
-    "has_ev": st.sidebar.checkbox("Do you own an Electric Vehicle (EV)?", value=False, help="Checks for heavy nightly charge loads (~3-7kW continuous draw overnight)"),
-    "electric_heating": st.sidebar.checkbox("Do you use electric space/water heating?", value=True, help="Allocates a larger signature weight to morning and winter spikes")
+    "has_ev": st.sidebar.checkbox("Do you own an Electric Vehicle (EV)?", value=False),
+    "electric_heating": st.sidebar.checkbox("Do you use electric space/water heating?", value=True)
 }
-
 
 # --- LOAD DATA ---
 df_raw = None
-if data_option == "Upload My Own File" and uploaded_file is not None:
-    with st.spinner("Processing your smart meter file..."):
+if data_option == "Use My Uploaded Smart Meter File" and os.path.exists(local_user_file):
+    with st.spinner("Processing local smart meter file..."):
+        with open(local_user_file, "rb") as f:
+            df_raw = parse_interval_csv(f)
+        if not df_raw.empty:
+            st.sidebar.success("✅ Loaded: " + local_user_file)
+elif data_option == "Upload My Own File" and uploaded_file is not None:
+    with st.spinner("Processing uploaded smart meter file..."):
         df_raw = parse_interval_csv(uploaded_file)
         if df_raw.empty:
-            st.error("Failed to parse the file. Please check if the file format matches an interval-based CSV/TXT, or use our Sample Demo Data.")
-        else:
-            st.success("Successfully parsed uploaded file!")
+            st.error("Failed to parse file. Please verify CSV structure.")
 elif data_option == "Use Sample Demo Data":
     df_raw = generate_demo_data()
-    st.info("💡 Displaying mock analytical data. Switch the data source in the sidebar to visualize your own smart meter profile!")
+    st.sidebar.info("💡 Using mock baseline data.")
 
 # --- DISPLAY DASHBOARD ---
 if df_raw is not None and not df_raw.empty:
@@ -467,112 +495,233 @@ if df_raw is not None and not df_raw.empty:
         "Select Target Period:",
         ["All Months"] + available_months,
         index=0,
-        help="Filters the KPIs, projections, and heatmaps below to a single billing month."
+        help="Select a specific month to see granular daily breakdowns and forecast projections."
     )
     
-    # Filter dataset accordingly
+    # Handle selected month data filter
     if selected_month != "All Months":
         df_filtered = df[df["year_month"] == selected_month].copy()
     else:
         df_filtered = df.copy()
 
-    # Aggregate Standing Charge Costs (based on filtered days)
-    unique_days = df_filtered["date_only"].nunique()
-    total_standing_charge = unique_days * rates["daily_standing_charge"]
+    # --- IDENTIFY IF SELECTED MONTH IS UNFINISHED ---
+    is_unfinished = False
+    proj_factor = 1.0
+    days_in_month = 30
+    days_elapsed = df_filtered["date_only"].nunique()
     
-    # 2. Key Metrics Calculations (Filtered)
-    total_kwh = df_filtered["estimated_kwh"].sum()
-    usage_cost = df_filtered["cost"].sum()
-    gross_cost = (usage_cost + total_standing_charge) * (1 + rates["vat_rate"])
+    if selected_month != "All Months":
+        # Extract year and month
+        try:
+            y_val, m_val = map(int, selected_month.split("-"))
+            days_in_month = calendar.monthrange(y_val, m_val)[1]
+            if days_elapsed < days_in_month:
+                is_unfinished = True
+                proj_factor = days_in_month / days_elapsed
+        except Exception:
+            pass
+
+    # Aggregate actual figures
+    actual_kwh = df_filtered["estimated_kwh"].sum()
+    actual_usage_cost = df_filtered["cost"].sum()
+    actual_standing_pso = days_elapsed * rates["daily_standing_charge"]
+    actual_gross_cost = (actual_usage_cost + actual_standing_pso) * (1 + rates["vat_rate"])
     
+    # Aggregate projected figures (if unfinished)
+    projected_kwh = actual_kwh * proj_factor
+    projected_usage_cost = actual_usage_cost * proj_factor
+    projected_standing_pso = days_in_month * rates["daily_standing_charge"]
+    projected_gross_cost = (projected_usage_cost + projected_standing_pso) * (1 + rates["vat_rate"])
+
+    # Max power spike details
     max_demand_row = df_filtered.loc[df_filtered["read_value_kw"].idxmax()]
     max_demand_kw = max_demand_row["read_value_kw"]
     max_demand_time = max_demand_row["reading_at"].strftime("%d %b %H:%M")
-    
-    avg_daily_kwh = total_kwh / unique_days
-    avg_daily_cost = gross_cost / unique_days
 
-    # Layout: Top Key KPI Cards
+    # --- DISPLAY METRICS WITH UNFINISHED CONTEXT ---
+    if is_unfinished:
+        st.warning(
+            f"⚠️ **Note: {selected_month} is a Partial/Unfinished Month.**\n"
+            f"Only **{days_elapsed} of {days_in_month} days** are recorded. Projections for the full month are highlighted in brown below."
+        )
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric(
-            label="Total Consumption", 
-            value=f"{total_kwh:,.1f} kWh", 
-            help="Sum of all interval energy usage during the selected period."
-        )
+        if is_unfinished:
+            st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-value" style="color: #4e342e;">{projected_kwh:,.1f} kWh</div>
+                <div class="metric-label">Estimated Month-End Usage</div>
+                <div class="metric-badge badge-projected">Actual to-date: {actual_kwh:,.1f} kWh</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-value" style="color: #0d47a1;">{actual_kwh:,.1f} kWh</div>
+                <div class="metric-label">Total Consumption</div>
+                <div class="metric-badge badge-actual">Completed Period</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
     with col2:
-        st.metric(
-            label="Total Cost (Inc. VAT & Standing)", 
-            value=f"€{gross_cost:,.2f}", 
-            help=f"Includes usage charges, daily standing charges + PSO Levy (totaling €{total_standing_charge:.2f}), and VAT ({rates['vat_rate']*100:.1f}%)."
-        )
+        if is_unfinished:
+            st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-value" style="color: #4e342e;">€{projected_gross_cost:,.2f}</div>
+                <div class="metric-label">Projected Month-End Bill</div>
+                <div class="metric-badge badge-projected">Actual to-date: €{actual_gross_cost:,.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-value" style="color: #1b5e20;">€{actual_gross_cost:,.2f}</div>
+                <div class="metric-label">Total Cost (Inc. VAT)</div>
+                <div class="metric-badge badge-success">Completed Period</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
     with col3:
-        st.metric(
-            label="Average Daily Cost", 
-            value=f"€{avg_daily_cost:.2f}/day",
-            help="Total calculated cost divided by number of unique days in the selected period."
-        )
+        avg_cost_day = (projected_gross_cost / days_in_month) if is_unfinished else (actual_gross_cost / days_elapsed)
+        avg_kwh_day = (projected_kwh / days_in_month) if is_unfinished else (actual_kwh / days_elapsed)
+        st.markdown(f"""
+        <div class="metric-container">
+            <div class="metric-value" style="color: #e65100;">€{avg_cost_day:.2f}/day</div>
+            <div class="metric-label">Avg Daily Cost</div>
+            <div class="metric-badge badge-warning">Avg Daily Usage: {avg_kwh_day:.2f} kWh</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
     with col4:
-        st.metric(
-            label="Peak Power Demand", 
-            value=f"{max_demand_kw:.2f} kW", 
-            delta=f"at {max_demand_time}",
-            delta_color="off"
-        )
+        st.markdown(f"""
+        <div class="metric-container">
+            <div class="metric-value" style="color: #37474f;">{max_demand_kw:.2f} kW</div>
+            <div class="metric-label">Peak Power Demand</div>
+            <div class="metric-badge badge-actual" style="background-color:#eceff1; color:#37474f;">Spike on {max_demand_time}</div>
+        </div>
+        """, unsafe_allow_html=True)
     
     st.markdown("---")
     
-    # TAB VIEW FOR SECTIONS
-    tab1, tab2, tab3, tab4 = st.tabs([
+    # --- TABS INDEX SETUP ---
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📈 Month-to-Month Overview",
         "📊 Usage & Cost Projections", 
         "⏰ Hourly & Peak Analysis", 
-        "🔌 Appliance Breakdown", 
-        "📅 Daily Patterns & Heatmaps"
+        "🔌 Appliance Breakdown",
+        "🎯 Bill Saving Simulator",
+        "🔍 Appliance Detective"
     ])
-    
-    # --- TAB 1: MONTHLY & PROJECTIONS ---
+
+    # ==========================================
+    # TAB 1: MONTH-TO-MONTH OVERVIEW DASHBOARD
+    # ==========================================
     with tab1:
-        current_year_month = datetime.now().strftime("%Y-%m")
+        st.subheader("🗓️ Month-to-Month Usage & Trend Overview")
         
-        # Scenario A: ALL MONTHS Selected -> Show monthly comparison bars
+        # Monthly aggregates
+        monthly_summary = df.groupby("year_month").agg(
+            total_kwh=("estimated_kwh", "sum"),
+            usage_cost=("cost", "sum"),
+            days_measured=("date_only", "nunique")
+        ).reset_index()
+        
+        # Format columns with VAT & Standing charges applied
+        monthly_summary["standing_charges"] = monthly_summary["days_measured"] * rates["daily_standing_charge"]
+        monthly_summary["total_cost_inc_vat"] = (monthly_summary["usage_cost"] + monthly_summary["standing_charges"]) * (1 + rates["vat_rate"])
+        monthly_summary["avg_daily_kwh"] = monthly_summary["total_kwh"] / monthly_summary["days_measured"]
+        
+        # Compute Month-on-Month % Changes
+        monthly_summary["kwh_pct_change"] = monthly_summary["total_kwh"].pct_change() * 100
+        monthly_summary["cost_pct_change"] = monthly_summary["total_cost_inc_vat"].pct_change() * 100
+        
+        # Check for uncompleted months in summary grid
+        monthly_summary["Status"] = "Completed"
+        for i, r in monthly_summary.iterrows():
+            y_part, m_part = map(int, r["year_month"].split("-"))
+            tot_days = calendar.monthrange(y_part, m_part)[1]
+            if r["days_measured"] < tot_days:
+                monthly_summary.at[i, "Status"] = "Incomplete (Partial)"
+                
+        # Visual charts for MoM
+        col_mom1, col_mom2 = st.columns(2)
+        
+        with col_mom1:
+            st.markdown("#### Monthly Consumption Trends")
+            fig_mom_kwh = px.line(
+                monthly_summary,
+                x="year_month",
+                y="total_kwh",
+                text=monthly_summary["total_kwh"].round(1),
+                markers=True,
+                color_discrete_sequence=["#1e88e5"]
+            )
+            # Custom large visual hover label
+            fig_mom_kwh.update_traces(
+                hovertemplate="<b>Month:</b> %{x}<br><b>Total Usage:</b> %{y:,.1f} kWh<extra></extra>",
+                hoverlabel=dict(bgcolor="#e3f2fd", font_size=16, font_family="monospace")
+            )
+            fig_mom_kwh.update_layout(xaxis_title="Month", yaxis_title="Total kWh Used")
+            st.plotly_chart(fig_mom_kwh, use_container_width=True)
+            
+        with col_mom2:
+            st.markdown("#### Monthly Total Bills (Inc. Standing & VAT)")
+            fig_mom_cost = px.bar(
+                monthly_summary,
+                x="year_month",
+                y="total_cost_inc_vat",
+                color="Status",
+                color_discrete_map={"Completed": "#2e7d32", "Incomplete (Partial)": "#ef6c00"},
+                text=monthly_summary["total_cost_inc_vat"].map(lambda x: f"€{x:.2f}")
+            )
+            fig_mom_cost.update_traces(
+                hovertemplate="<b>Month:</b> %{x}<br><b>Total Bill:</b> €%{y:.2f}<extra></extra>",
+                hoverlabel=dict(bgcolor="#e8f5e9", font_size=16, font_family="monospace")
+            )
+            fig_mom_cost.update_layout(xaxis_title="Month", yaxis_title="Total Bill (€)")
+            st.plotly_chart(fig_mom_cost, use_container_width=True)
+            
+        # Summary Grid
+        st.markdown("#### Month-on-Month Financial & Usage Summary")
+        grid_df = monthly_summary.copy()
+        grid_df["total_kwh"] = grid_df["total_kwh"].map(lambda x: f"{x:,.1f} kWh")
+        grid_df["total_cost_inc_vat"] = grid_df["total_cost_inc_vat"].map(lambda x: f"€{x:,.2f}")
+        grid_df["avg_daily_kwh"] = grid_df["avg_daily_kwh"].map(lambda x: f"{x:.2f} kWh/day")
+        grid_df["kwh_pct_change"] = grid_df["kwh_pct_change"].map(lambda x: f"{x:+.1f}%" if pd.notnull(x) else "-")
+        grid_df["cost_pct_change"] = grid_df["cost_pct_change"].map(lambda x: f"{x:+.1f}%" if pd.notnull(x) else "-")
+        
+        st.table(grid_df[[
+            "year_month", "days_measured", "total_kwh", "total_cost_inc_vat", "avg_daily_kwh", "kwh_pct_change", "cost_pct_change", "Status"
+        ]].rename(columns={
+            "year_month": "Month", "days_measured": "Days Tracked", "total_kwh": "Usage (kWh)",
+            "total_cost_inc_vat": "Total Cost", "avg_daily_kwh": "Avg Daily Consumption",
+            "kwh_pct_change": "MoM Usage Change", "cost_pct_change": "MoM Cost Change"
+        }))
+
+    # ==========================================
+    # TAB 2: MONTHLY DETAIL & GRANULAR DAILY FORECASTS
+    # ==========================================
+    with tab2:
         if selected_month == "All Months":
-            st.subheader("Monthly Usage, Actual Costs & Projections")
+            st.subheader("Monthly Usage & Projected Cost Outlook")
             
-            # Monthly grouping
-            monthly_summary = df.groupby("year_month").agg(
-                total_kwh=("estimated_kwh", "sum"),
-                usage_cost=("cost", "sum"),
-                days_in_dataset=("date_only", "nunique")
-            ).reset_index()
-            
-            # Calculate standing charges and VAT per month
-            monthly_summary["standing_charges"] = monthly_summary["days_in_dataset"] * rates["daily_standing_charge"]
-            monthly_summary["total_cost_inc_vat"] = (monthly_summary["usage_cost"] + monthly_summary["standing_charges"]) * (1 + rates["vat_rate"])
-            
-            has_current_month = current_year_month in monthly_summary["year_month"].values
-            
+            # Reconstruct projections for any incomplete month
             projections_list = []
             for index, row in monthly_summary.iterrows():
-                is_current = row["year_month"] == current_year_month
-                days_tracked = row["days_in_dataset"]
+                y_p, m_p = map(int, row["year_month"].split("-"))
+                tot_days = calendar.monthrange(y_p, m_p)[1]
                 
-                # Estimate remaining days in month
-                year, month = map(int, row["year_month"].split("-"))
-                next_month = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
-                total_days_in_month = (next_month - datetime(year, month, 1)).days
-                
-                if is_current and days_tracked < total_days_in_month:
-                    avg_kwh_per_day = row["total_kwh"] / days_tracked
-                    avg_cost_per_day = row["total_cost_inc_vat"] / days_tracked
-                    
-                    projected_kwh = avg_kwh_per_day * total_days_in_month
-                    projected_cost = avg_cost_per_day * total_days_in_month
+                if row["days_measured"] < tot_days:
+                    f = tot_days / row["days_measured"]
+                    proj_k = row["total_kwh"] * f
+                    proj_c = row["total_cost_inc_vat"] * f
                     
                     projections_list.append({
                         "Month": row["year_month"],
                         "Status": "Projected (Full Month)",
-                        "Consumption (kWh)": projected_kwh,
-                        "Total Cost (€)": projected_cost
+                        "Consumption (kWh)": proj_k,
+                        "Total Cost (€)": proj_c
                     })
                     projections_list.append({
                         "Month": row["year_month"],
@@ -590,138 +739,93 @@ if df_raw is not None and not df_raw.empty:
                     
             proj_df = pd.DataFrame(projections_list)
             
-            # Render charts for Monthly
-            m_col1, m_col2 = st.columns(2)
-            
-            with m_col1:
-                st.markdown("#### Monthly Consumption (kWh)")
-                fig_month_kwh = px.bar(
-                    proj_df, 
-                    x="Month", 
-                    y="Consumption (kWh)", 
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                fig_bar_kwh = px.bar(
+                    proj_df,
+                    x="Month",
+                    y="Consumption (kWh)",
                     color="Status",
                     barmode="group",
                     color_discrete_map={
-                        "Actual (Complete)": "#1E88E5",
-                        "Actual (To-Date)": "#1565C0",
-                        "Projected (Full Month)": "#90CAF9"
-                    },
-                    text_auto=".0f"
+                        "Actual (Complete)": "#1e88e5",
+                        "Actual (To-Date)": "#1565c0",
+                        "Projected (Full Month)": "#a1887f"
+                    }
                 )
-                fig_month_kwh.update_layout(xaxis_title="Month", yaxis_title="kWh Used", legend_title="Usage Category")
-                st.plotly_chart(fig_month_kwh, use_container_width=True)
+                fig_bar_kwh.update_traces(
+                    hovertemplate="<b>Month:</b> %{x}<br><b>Usage:</b> %{y:,.1f} kWh<extra></extra>",
+                    hoverlabel=dict(font_size=15, font_family="monospace")
+                )
+                st.plotly_chart(fig_bar_kwh, use_container_width=True)
                 
-            with m_col2:
-                st.markdown("#### Monthly Cost (€)")
-                fig_month_cost = px.bar(
-                    proj_df, 
-                    x="Month", 
-                    y="Total Cost (€)", 
+            with col_p2:
+                fig_bar_cost = px.bar(
+                    proj_df,
+                    x="Month",
+                    y="Total Cost (€)",
                     color="Status",
                     barmode="group",
                     color_discrete_map={
-                        "Actual (Complete)": "#2E7D32",
-                        "Actual (To-Date)": "#1B5E20",
-                        "Projected (Full Month)": "#A5D6A7"
-                    },
-                    text_auto=".2f"
+                        "Actual (Complete)": "#2e7d32",
+                        "Actual (To-Date)": "#1b5e20",
+                        "Projected (Full Month)": "#8d6e63"
+                    }
                 )
-                fig_month_cost.update_layout(xaxis_title="Month", yaxis_title="Total Bill (€)", legend_title="Cost Status")
-                st.plotly_chart(fig_month_cost, use_container_width=True)
+                fig_bar_cost.update_traces(
+                    hovertemplate="<b>Month:</b> %{x}<br><b>Cost:</b> €%{y:.2f}<extra></extra>",
+                    hoverlabel=dict(font_size=15, font_family="monospace")
+                )
+                st.plotly_chart(fig_bar_cost, use_container_width=True)
                 
-            # Explanatory projection text card
-            if has_current_month:
-                this_month_proj = proj_df[(proj_df["Month"] == current_year_month) & (proj_df["Status"] == "Projected (Full Month)")]
-                this_month_act = proj_df[(proj_df["Month"] == current_year_month) & (proj_df["Status"] == "Actual (To-Date)")]
-                
-                if not this_month_proj.empty and not this_month_act.empty:
-                    proj_val = this_month_proj["Total Cost (€)"].values[0]
-                    act_val = this_month_act["Total Cost (€)"].values[0]
-                    days_elapsed = monthly_summary[monthly_summary["year_month"] == current_year_month]["days_in_dataset"].values[0]
-                    
-                    st.info(
-                        f"🔮 **Current Month Projection ({current_year_month}):** Based on the first **{days_elapsed} days** of this month, "
-                        f"your actual usage cost so far is **€{act_val:.2f}**. "
-                        f"At your current rate of consumption, we project your final bill for this month to reach **€{proj_val:.2f}**."
-                    )
-        
-        # Scenario B: SPECIFIC MONTH SELECTED -> Zoom into Daily Granular View for that Month
         else:
-            st.subheader(f"Daily Details for Selected Month: {selected_month}")
+            st.subheader(f"📅 Granular Daily Breakdowns for {selected_month}")
             
             daily_summary = df_filtered.groupby("date_only").agg(
                 total_kwh=("estimated_kwh", "sum"),
                 usage_cost=("cost", "sum")
             ).reset_index()
+            daily_summary["total_cost"] = (daily_summary["usage_cost"] + rates["daily_standing_charge"]) * (1 + rates["vat_rate"])
             
-            # Daily standing charge + VAT application
-            daily_summary["total_cost_inc_vat"] = (daily_summary["usage_cost"] + rates["daily_standing_charge"]) * (1 + rates["vat_rate"])
-            
-            m_col1, m_col2 = st.columns(2)
-            
-            with m_col1:
-                st.markdown(f"#### Daily Consumption in {selected_month} (kWh)")
-                fig_daily_kwh = px.bar(
-                    daily_summary,
-                    x="date_only",
-                    y="total_kwh",
-                    color_discrete_sequence=["#1E88E5"]
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                st.markdown("#### Daily Energy Consumed (kWh)")
+                fig_day_kwh = px.bar(daily_summary, x="date_only", y="total_kwh", color_discrete_sequence=["#1e88e5"])
+                fig_day_kwh.update_traces(
+                    hovertemplate="<b>Date:</b> %{x}<br><b>Consumption:</b> %{y:.2f} kWh<extra></extra>",
+                    hoverlabel=dict(bgcolor="#bbdefb", font_size=15, font_family="monospace")
                 )
-                fig_daily_kwh.update_layout(xaxis_title="Date", yaxis_title="Daily kWh")
-                st.plotly_chart(fig_daily_kwh, use_container_width=True)
+                st.plotly_chart(fig_day_kwh, use_container_width=True)
                 
-            with m_col2:
-                st.markdown(f"#### Daily Cost in {selected_month} (€)")
-                fig_daily_cost = px.bar(
-                    daily_summary,
-                    x="date_only",
-                    y="total_cost_inc_vat",
-                    color_discrete_sequence=["#2E7D32"]
+            with col_d2:
+                st.markdown("#### Daily Total Cost (Inc. Standing & VAT)")
+                fig_day_cost = px.bar(daily_summary, x="date_only", y="total_cost", color_discrete_sequence=["#2e7d32"])
+                fig_day_cost.update_traces(
+                    hovertemplate="<b>Date:</b> %{x}<br><b>Cost:</b> €%{y:.2f}<extra></extra>",
+                    hoverlabel=dict(bgcolor="#c8e6c9", font_size=15, font_family="monospace")
                 )
-                fig_daily_cost.update_layout(xaxis_title="Date", yaxis_title="Daily Cost Inc. VAT & Standing (€)")
-                st.plotly_chart(fig_daily_cost, use_container_width=True)
-            
-            # If the selected month is the active current month, offer daily extrapolation card
-            if selected_month == current_year_month:
-                days_elapsed = daily_summary["date_only"].nunique()
-                year, month = map(int, selected_month.split("-"))
-                next_month = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
-                total_days_in_month = (next_month - datetime(year, month, 1)).days
-                
-                if days_elapsed < total_days_in_month:
-                    avg_daily_act_kwh = total_kwh / days_elapsed
-                    avg_daily_act_cost = gross_cost / days_elapsed
-                    
-                    proj_full_month_kwh = avg_daily_act_kwh * total_days_in_month
-                    proj_full_month_cost = avg_daily_act_cost * total_days_in_month
-                    
-                    st.info(
-                        f"🔮 **Projection for Current Month ({selected_month}):** Based on **{days_elapsed} elapsed days** of this month:\n"
-                        f"- **Current Accumulation:** {total_kwh:,.1f} kWh consumed with a total cost of **€{gross_cost:.2f}**.\n"
-                        f"- **Forecasted Month-End Usage:** **{proj_full_month_kwh:,.1f} kWh**.\n"
-                        f"- **Forecasted Month-End Cost:** **€{proj_full_month_cost:.2f}**."
-                    )
+                st.plotly_chart(fig_day_cost, use_container_width=True)
 
-    # --- TAB 2: HOURLY & PEAK ANALYSIS ---
-    with tab2:
-        st.subheader("Usage Profile by Hour of Day & Weekday")
+    # ==========================================
+    # TAB 3: HOURLY & PEAK ANALYSIS
+    # ==========================================
+    with tab3:
+        st.subheader("⏰ Usage Profiling by Hour of Day & Spikes")
         
-        # Diurnal (hourly) usage profile (Filtered)
-        hourly_summary = df_filtered.groupby(["hour_of_day"]).agg(
-            avg_kwh=("estimated_kwh", "mean"),
-            total_kwh=("estimated_kwh", "sum")
+        # Diurnal usage
+        hourly_day_summary = df_filtered.groupby(["hour_of_day"]).agg(
+            avg_kwh=("estimated_kwh", "mean")
         ).reset_index()
         
-        # Weekday vs Weekend Average profile (Filtered)
+        # Weekday vs Weekend Average profile
         df_filtered["day_type"] = np.where(df_filtered["reading_at"].dt.dayofweek < 5, "Weekday", "Weekend")
         hourly_daytype_summary = df_filtered.groupby(["hour_of_day", "day_type"]).agg(
             avg_kwh=("estimated_kwh", "mean")
         ).reset_index()
         
-        h_col1, h_col2 = st.columns(2)
-        
-        with h_col1:
-            st.markdown("#### Average Energy Profile by Hour of Day")
+        col_h1, col_h2 = st.columns(2)
+        with col_h1:
+            st.markdown("#### Average Usage Profile per Hour")
             fig_hourly = px.line(
                 hourly_daytype_summary, 
                 x="hour_of_day", 
@@ -730,77 +834,57 @@ if df_raw is not None and not df_raw.empty:
                 markers=True,
                 color_discrete_sequence=["#FF7043", "#26A69A"]
             )
-            fig_hourly.update_layout(
-                xaxis=dict(tickmode="linear", tick0=0, dtick=2),
-                xaxis_title="Hour of Day (24h)",
-                yaxis_title="Average Usage (kWh)",
-                legend_title="Day Type"
+            fig_hourly.update_traces(
+                hovertemplate="<b>Hour:</b> %{x}:00<br><b>Avg Usage:</b> %{y:.3f} kWh<extra></extra>",
+                hoverlabel=dict(font_size=15, font_family="monospace")
             )
+            fig_hourly.update_layout(xaxis=dict(tickmode="linear", tick0=0, dtick=2), xaxis_title="Hour of Day (24h)")
             st.plotly_chart(fig_hourly, use_container_width=True)
             
-        with h_col2:
-            st.markdown("#### Consumption Share by Time Window")
-            df_temp = df_filtered.copy()
-            conditions_temp = [
-                (df_temp["hour_of_day"] >= 23) | (df_temp["hour_of_day"] < 8),
-                (df_temp["hour_of_day"] >= 17) & (df_temp["hour_of_day"] < 19)
+        with col_h2:
+            st.markdown("#### Share of Consumption by Time Windows")
+            df_windows = df_filtered.copy()
+            conditions = [
+                (df_windows["hour_of_day"] >= 23) | (df_windows["hour_of_day"] < 8),
+                (df_windows["hour_of_day"] >= 17) & (df_windows["hour_of_day"] < 19)
             ]
-            df_temp["virtual_band"] = np.select(conditions_temp, ["Night Time", "Peak Time (17-19)"], default="Standard Day")
+            df_windows["time_window"] = np.select(conditions, ["Night (23:00-08:00)", "Peak (17:00-19:00)"], default="Day (08:00-17:00 / 19:00-23:00)")
+            window_summary = df_windows.groupby("time_window")["estimated_kwh"].sum().reset_index()
             
-            temp_breakdown = df_temp.groupby("virtual_band").agg(
-                total_kwh=("estimated_kwh", "sum")
-            ).reset_index()
-            
-            fig_pie = px.pie(
-                temp_breakdown, 
-                values="total_kwh", 
-                names="virtual_band",
-                color="virtual_band",
-                color_discrete_map={"Standard Day": "#FFCA28", "Night Time": "#5C6BC0", "Peak Time (17-19)": "#EF5350"},
+            fig_pie_win = px.pie(
+                window_summary,
+                values="estimated_kwh",
+                names="time_window",
+                color="time_window",
+                color_discrete_map={
+                    "Day (08:00-17:00 / 19:00-23:00)": "#FFCA28",
+                    "Night (23:00-08:00)": "#5C6BC0",
+                    "Peak (17:00-19:00)": "#EF5350"
+                },
                 hole=0.4
             )
-            fig_pie.update_traces(textinfo="percent+label")
-            fig_pie.update_layout(legend_title="Time Window")
-            st.plotly_chart(fig_pie, use_container_width=True)
-            
-        st.markdown("---")
-        st.markdown("#### ⚡ Demand Shift & Load Insights")
-        p_col1, p_col2 = st.columns(2)
-        
-        with p_col1:
-            peak_only = df_filtered[(df_filtered["hour_of_day"] >= 17) & (df_filtered["hour_of_day"] < 19)]
-            avg_peak_load = peak_only["read_value_kw"].mean() if not peak_only.empty else 0.0
-            st.markdown(
-                f"""
-                * **Peak Period (17:00 - 19:00):** Your average demand during evening peak window is **{avg_peak_load:.2f} kW**.
-                * **Bill-Saving Insights:** Even though you are on a **24-Hour Flat Tariff ({rates.get('flat_rate', 0)*100:.2f} c/kWh)**, you can use these charts to simulate potential savings if you were to shift major appliances to night hours and switch to a Time-of-Use smart tariff.
-                """
+            fig_pie_win.update_traces(
+                textinfo="percent+label",
+                hovertemplate="<b>Window:</b> %{label}<br><b>Total Used:</b> %{value:,.1f} kWh<extra></extra>",
+                hoverlabel=dict(font_size=15)
             )
-            
-        with p_col2:
-            top_peaks = df_filtered.sort_values(by="read_value_kw", ascending=False).head(5)
-            st.markdown("**Top 5 Single Highest Appliance Spikes Recorded:**")
-            for _, r in top_peaks.iterrows():
-                st.write(f"- 🔴 **{r['read_value_kw']:.2f} kW** on {r['reading_at'].strftime('%A, %d %b %Y at %H:%M')}")
+            st.plotly_chart(fig_pie_win, use_container_width=True)
 
-
-    # --- TAB 3: APPLIANCE BREAKDOWN ---
+    # ==========================================
+    # TAB 4: APPLIANCE BREAKDOWN
+    # ==========================================
     with tab4:
-        st.write("") # Kept intact as Tab 4 for formatting, but actual view will render under Appliance Breakdown below.
-
-    with tab3:
         st.subheader("🔌 Replicated Appliance Disaggregation")
         st.markdown(
-            "Below is the estimated category breakdown of your smart meter data using a statistical baseline and time-of-day heuristic engine. "
-            "Update your household profile questions in the sidebar to refine this output."
+            "Based on baseline continuous draws during quiet overnight hours and mealtime behavioral signatures, "
+            "the engine maps your total consumption to the following groups:"
         )
         
-        # Run Heuristics Engine
+        # Run disaggregation
         dis_df = disaggregate_appliances(df_filtered, house_profile)
         
-        # Sum up disaggregated columns
-        app_cols = {
-            "app_always_on": "Always On (Baseload)",
+        app_categories = {
+            "app_always_on": "Always On (Baseload Standby)",
             "app_heating": "Space & Water Heating",
             "app_cooking": "Cooking & Kitchen",
             "app_laundry": "Laundry & Dishwasher",
@@ -809,139 +893,280 @@ if df_raw is not None and not df_raw.empty:
             "app_misc": "Other / Unclassified"
         }
         
-        # Calculate sums and costs per appliance
-        app_data = []
-        for col_name, label in app_cols.items():
+        app_costs_data = []
+        for col_name, label in app_categories.items():
             if col_name == "app_ev" and not house_profile["has_ev"]:
                 continue
                 
-            total_app_kwh = dis_df[col_name].sum()
+            tot_kwh = dis_df[col_name].sum()
+            tot_cost = (dis_df[col_name] * dis_df["tariff_rate"]).sum()
             
-            # Map cost proportionally based on interval-specific tariff rates
-            # This handles cases where certain appliances run heavily on flat vs. time-of-use night rates
-            if "cost" in dis_df.columns:
-                total_app_cost = (dis_df[col_name] * dis_df["tariff_rate"]).sum()
-            else:
-                total_app_cost = total_app_kwh * (rates.get("flat_rate") if rates["type"] == "flat" else rates.get("day_rate", 0.30))
-                
             # Apply proportional standing charge and VAT
-            app_share = total_app_kwh / total_kwh if total_kwh > 0 else 0
-            allocated_standing_vat = (total_standing_charge * app_share) * (1 + rates["vat_rate"])
-            total_app_cost_inc_vat = (total_app_cost * (1 + rates["vat_rate"])) + allocated_standing_vat
+            proportion = tot_kwh / total_kwh if total_kwh > 0 else 0
+            standing_apportioned = proportion * total_standing_charge
+            tot_gross_cost = (tot_cost + standing_apportioned) * (1 + rates["vat_rate"])
             
-            app_data.append({
+            app_costs_data.append({
                 "Appliance Category": label,
-                "Consumption (kWh)": total_app_kwh,
-                "Estimated Cost (€)": total_app_cost_inc_vat
+                "Consumption (kWh)": tot_kwh,
+                "Estimated Cost (€)": tot_gross_cost
             })
             
-        app_summary = pd.DataFrame(app_data)
+        app_summary = pd.DataFrame(app_costs_data)
         
-        # Render disaggregation visualizations
-        app_col1, app_col2 = st.columns(2)
-        
-        with app_col1:
-            st.markdown("#### Appliance Energy Share (%)")
+        col_a1, col_a2 = st.columns(2)
+        with col_a1:
+            st.markdown("#### Appliance Energy Share")
             fig_app_pie = px.pie(
                 app_summary,
                 values="Consumption (kWh)",
                 names="Appliance Category",
-                color="Appliance Category",
-                color_discrete_sequence=px.colors.qualitative.Pastel,
+                color_discrete_sequence=px.colors.qualitative.Safe,
                 hole=0.4
             )
-            fig_app_pie.update_traces(textinfo="percent+label")
+            fig_app_pie.update_traces(
+                textinfo="percent+label",
+                hovertemplate="<b>Category:</b> %{label}<br><b>Energy:</b> %{value:,.1f} kWh<extra></extra>",
+                hoverlabel=dict(font_size=15)
+            )
             st.plotly_chart(fig_app_pie, use_container_width=True)
             
-        with app_col2:
-            st.markdown("#### Estimated Cost Breakdown (€)")
-            fig_app_cost = px.bar(
-                app_summary.sort_values(by="Estimated_Cost", s=False) if "Estimated_Cost" in app_summary else app_summary,
+        with col_a2:
+            st.markdown("#### Estimated Bill Contribution")
+            fig_app_bar = px.bar(
+                app_summary,
                 x="Appliance Category",
                 y="Estimated Cost (€)",
-                text_auto=".2f",
                 color="Appliance Category",
-                color_discrete_sequence=px.colors.qualitative.Pastel
+                color_discrete_sequence=px.colors.qualitative.Safe,
+                text=app_summary["Estimated Cost (€)"].map(lambda x: f"€{x:.2f}")
             )
-            fig_app_cost.update_layout(xaxis_title="Category", yaxis_title="Total Bill Portion (€)", showlegend=False)
-            st.plotly_chart(fig_app_cost, use_container_width=True)
+            fig_app_bar.update_traces(
+                hovertemplate="<b>Category:</b> %{x}<br><b>Bill Portion:</b> €%{y:.2f}<extra></extra>",
+                hoverlabel=dict(font_size=15, font_family="monospace")
+            )
+            fig_app_bar.update_layout(showlegend=False)
+            st.plotly_chart(fig_app_bar, use_container_width=True)
+
+    # ==========================================
+    # TAB 5: BILL SAVING SIMULATOR (BEHAVIORAL ENGINE)
+    # ==========================================
+    with tab5:
+        st.subheader("🎯 Interactive Smart Saving Simulator")
+        st.markdown(
+            "Select an exact reduction target in Euros, check the boxes for your preferred saving habits, "
+            "and watch how they impact your final bill in real time!"
+        )
+        
+        # User input target
+        target_savings = st.slider("Select Your Target Monthly Savings:", min_value=5, max_value=100, value=20, step=5, format="€%d")
+        
+        # Calculate needed kWh reduction
+        # (Savings / (1 + VAT)) / Tariff Unit Cost
+        avg_tariff_rate = rates["flat_rate"] if rates["type"] == "flat" else (actual_usage_cost / actual_kwh if actual_kwh > 0 else 0.28)
+        needed_kwh_reduction = (target_savings / (1 + rates["vat_rate"])) / avg_tariff_rate
+        
+        st.markdown(f"To save **€{target_savings:.2f}** this month, you need to reduce your consumption by **{needed_kwh_reduction:.1f} kWh**.")
+        
+        st.markdown("#### 🛠️ Customize Your Saving Actions:")
+        
+        savings_actions = [
+            {
+                "id": "always_on",
+                "label": "🔌 Lower standby load (unplug TVs, routers, chargers when sleep/away)",
+                "kwh_save": 0.04 * 24 * 30, # 40W standby saved for 24h over 30 days
+                "desc": "Saves ~28.8 kWh/month (unplugs minor items continuous draw)."
+            },
+            {
+                "id": "wash_30",
+                "label": "🧼 Wash laundry at 30°C instead of 40°C or higher",
+                "kwh_save": 0.8 * 12, # Saves 0.8 kWh per load, assuming 12 loads/month
+                "desc": "Saves ~9.6 kWh/month (heating elements use less electricity)."
+            },
+            {
+                "id": "dryer_line",
+                "label": "☀️ Hang-dry clothes instead of using tumble dryer",
+                "kwh_save": 2.5 * 8, # Saves 2.5 kWh per load, assumes 8 loads/month skipped
+                "desc": "Saves ~20.0 kWh/month (dryers are high-consumption resistive heat loads)."
+            },
+            {
+                "id": "heating_one_deg",
+                "label": "🌡️ Lower water heating thermostat by 1°C",
+                "kwh_save": 1.2 * 30, # Saves 1.2 kWh/day
+                "desc": "Saves ~36.0 kWh/month (reduces heat pump / heating element work cycles)."
+            },
+            {
+                "id": "led_swap",
+                "label": "💡 Swap 5 halogen bulbs for smart/eco LEDs",
+                "kwh_save": 0.18 * 5 * 30, # 180W total saved for 5 hours daily over 30 days
+                "desc": "Saves ~27.0 kWh/month."
+            }
+        ]
+        
+        selected_savings_kwh = 0.0
+        for action in savings_actions:
+            checked = st.checkbox(f"{action['label']} — *{action['desc']}*", value=False)
+            if checked:
+                selected_savings_kwh += action["kwh_save"]
+                
+        # Calculate progress
+        pct_achieved = min(100.0, (selected_savings_kwh / needed_kwh_reduction) * 100.0) if needed_kwh_reduction > 0 else 0.0
+        saved_euros = (selected_savings_kwh * avg_tariff_rate) * (1 + rates["vat_rate"])
+        
+        st.markdown("---")
+        st.markdown("### 🏆 Savings Progress Summary:")
+        
+        # Color code success level
+        if pct_achieved >= 100.0:
+            st.success(f"🎉 **Goal Achieved!** You have configured actions saving **{selected_savings_kwh:.1f} kWh**, equivalent to saving **€{saved_euros:.2f}** this month!")
+        else:
+            st.info(f"⚡ **Keep Going!** You have configured actions saving **{selected_savings_kwh:.1f} kWh** of the **{needed_kwh_reduction:.1f} kWh** needed. You are saving **€{saved_euros:.2f}** so far.")
+            
+        st.progress(pct_achieved / 100.0)
+        
+        # Visual target chart
+        fig_savings = go.Figure()
+        fig_savings.add_trace(go.Indicator(
+            mode = "gauge+number+delta",
+            value = saved_euros,
+            domain = {'x': [0, 1], 'y': [0, 1]},
+            title = {'text': "Target vs Simulated Monthly Savings (€)", 'font': {'size': 20}},
+            delta = {'reference': target_savings, 'increasing': {'color': "green"}},
+            gauge = {
+                'axis': {'range': [None, max(target_savings * 1.3, 40)]},
+                'bar': {'color': "#1b5e20"},
+                'steps': [
+                    {'range': [0, target_savings], 'color': "#ffe0b2"},
+                    {'range': [target_savings, max(target_savings * 1.3, 40)], 'color': "#c8e6c9"}
+                ],
+                'threshold': {
+                    'line': {'color': "red", 'width': 4},
+                    'thickness': 0.75,
+                    'value': target_savings
+                }
+            }
+        ))
+        st.plotly_chart(fig_savings, use_container_width=True)
+
+    # ==========================================
+    # TAB 6: APPLIANCE DETECTIVE (NEW SENSOR ENGINE)
+    # ==========================================
+    with tab6:
+        st.subheader("🔍 Smart Signature Detective")
+        st.markdown(
+            "This diagnostic engine scans your raw interval meter logs for specific **appliance spike signatures** based on their physical power profiles:"
+        )
+        
+        det_col1, det_col2 = st.columns(2)
+        
+        with det_col1:
+            st.info(
+                "🛁 **Shower Run Profile:**\n"
+                "A standard Irish instantaneous electric shower draws **8.5 kW to 10.5 kW**. "
+                "Even a quick 10-minute shower consumes roughly **1.2 to 1.8 kWh** within a single 30-minute interval, creating a sudden, massive spike. "
+                "Any isolated reading exceeding **0.8 kWh** is flagged below."
+            )
+            
+        with det_col2:
+            st.success(
+                "🍵 **Kettle Boil Profile:**\n"
+                "A standard $3\text{ kW}$ domestic kettle boiled for 3 minutes consumes exactly **0.15 kWh**. "
+                "A rapid kettle run creates a moderate daytime block spike that sits clearly above your baseline background load. "
+                "Any daytime active surge between **0.15 and 0.4 kWh** is evaluated below."
+            )
             
         st.markdown("---")
-        st.markdown("#### 🕒 Average Diurnal Appliance Timeline")
-        st.markdown("This chart displays how your dynamic appliance loads shift and overlap throughout an average 24-hour day in your selected dataset.")
         
-        # Group by hour of day for stacked timeline
-        timeline_cols = list(app_cols.keys())
-        if not house_profile["has_ev"]:
-            timeline_cols.remove("app_ev")
-            
-        hourly_timeline = dis_df.groupby("hour_of_day")[timeline_cols].mean().reset_index()
-        hourly_timeline = hourly_timeline.rename(columns=app_cols)
+        # 1. Shower Run Detection Algorithm
+        # Filter for isolated peaks: reading > 0.8 kWh, while previous and next readings are near typical background load (< 0.4 kWh)
+        df_detect = df_filtered.copy()
         
-        # Melt dataframe for easy stacked charting
-        melted_timeline = hourly_timeline.melt(
-            id_vars=["hour_of_day"],
-            value_vars=list(hourly_timeline.columns[1:]),
-            var_name="Appliance Category",
-            value_name="Average Hourly Consumption (kWh)"
+        # Shift values to detect adjacent intervals (ensures isolated spikes)
+        df_detect["prev_kwh"] = df_detect["estimated_kwh"].shift(1)
+        df_detect["next_kwh"] = df_detect["estimated_kwh"].shift(-1)
+        
+        shower_condition = (
+            (df_detect["estimated_kwh"] >= 0.80) & 
+            (df_detect["prev_kwh"] < 0.45) & 
+            (df_detect["next_kwh"] < 0.45)
         )
+        shower_runs = df_detect[shower_condition].copy()
         
-        fig_timeline = px.bar(
-            melted_timeline,
-            x="hour_of_day",
-            y="Average Hourly Consumption (kWh)",
-            color="Appliance Category",
-            color_discrete_sequence=px.colors.qualitative.Pastel
+        # Apply VAT + standing charge equivalent to each run for financial impact
+        shower_runs["run_cost"] = (shower_runs["estimated_kwh"] * rates["flat_rate"] if rates["type"] == "flat" else shower_runs["cost"]) * (1 + rates["vat_rate"])
+        
+        # 2. Kettle Run Detection Algorithm
+        # Looks for minor spikes between 0.15 kWh and 0.40 kWh above adjacent interval values, occurring during typical daytime hours (07:00 to 22:00)
+        df_detect["local_ambient_avg"] = (df_detect["prev_kwh"] + df_detect["next_kwh"]) / 2
+        df_detect["net_spike_above_baseline"] = df_detect["estimated_kwh"] - df_detect["local_ambient_avg"]
+        
+        kettle_condition = (
+            (df_detect["net_spike_above_baseline"] >= 0.12) & 
+            (df_detect["net_spike_above_baseline"] <= 0.35) & 
+            (df_detect["hour_of_day"] >= 7) & 
+            (df_detect["hour_of_day"] <= 22) &
+            (df_detect["estimated_kwh"] < 0.80) # Ensure we don't double count shower runs
         )
-        fig_timeline.update_layout(
-            xaxis=dict(tickmode="linear", tick0=0, dtick=1),
-            xaxis_title="Hour of Day (24h Stacked View)",
-            yaxis_title="Avg Consumption per Hour (kWh)"
-        )
-        st.plotly_chart(fig_timeline, use_container_width=True)
-
-
-    # --- TAB 4: DAILY PATTERNS & HEATMAPS ---
-    with tab4:
-        st.subheader("Daily Trends and Heatmap Distribution")
+        kettle_runs = df_detect[kettle_condition].copy()
+        kettle_runs["run_cost"] = (kettle_runs["net_spike_above_baseline"] * rates["flat_rate"] if rates["type"] == "flat" else kettle_runs["cost"]) * (1 + rates["vat_rate"])
         
-        # Line plot of daily usage (Filtered)
-        daily_kwh = df_filtered.groupby("date_only").agg(
-            total_kwh=("estimated_kwh", "sum"),
-            cost_inc_standing=("cost", lambda x: (x.sum() + rates["daily_standing_charge"]) * (1 + rates["vat_rate"]))
-        ).reset_index()
+        # Display Results
+        res_col1, res_col2 = st.columns(2)
         
-        fig_daily = px.area(
-            daily_kwh, 
-            x="date_only", 
-            y="total_kwh", 
-            line_shape="spline",
-            color_discrete_sequence=["#26A69A"]
-        )
-        fig_daily.update_layout(
-            xaxis_title="Date",
-            yaxis_title="Daily Consumption (kWh)",
-            hovermode="x unified"
-        )
-        st.plotly_chart(fig_daily, use_container_width=True)
-        
-        # 2D Heatmap of hour vs day of week (Filtered)
-        st.markdown("#### Hourly vs Day-of-Week Intensity Heatmap")
-        heatmap_data = df_filtered.groupby(["day_name", "hour_of_day"])["estimated_kwh"].mean().reset_index()
-        
-        # Sort days correctly
-        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        heatmap_pivot = heatmap_data.pivot(index="day_name", columns="hour_of_day", values="estimated_kwh").reindex(day_order)
-        
-        fig_heatmap = px.imshow(
-            heatmap_pivot,
-            labels=dict(x="Hour of Day", y="Day of Week", color="Avg kWh"),
-            x=list(range(24)),
-            y=day_order,
-            color_continuous_scale="Viridis"
-        )
-        fig_heatmap.update_layout(xaxis=dict(tickmode="linear", tick0=0, dtick=1))
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+        with res_col1:
+            st.markdown(f"#### 🛁 Detected Electric Shower Runs ({len(shower_runs)})")
+            if not shower_runs.empty:
+                show_df = shower_runs[["reading_at", "day_name", "estimated_kwh", "run_cost"]].copy()
+                show_df["Time of Run"] = show_df["reading_at"].dt.strftime("%d %b %Y (%H:%M)")
+                show_df["Consumption"] = show_df["estimated_kwh"].map(lambda x: f"{x:.2f} kWh")
+                show_df["Cost (Inc. VAT)"] = show_df["run_cost"].map(lambda x: f"€{x:.2f}")
+                
+                # Plotly Interactive Spike Timeline
+                fig_shower = px.scatter(
+                    show_df, 
+                    x="reading_at", 
+                    y="estimated_kwh", 
+                    size="estimated_kwh", 
+                    color="run_cost",
+                    color_continuous_scale="Reds",
+                    labels={"reading_at": "Date & Time", "estimated_kwh": "Interval Spike Size (kWh)"}
+                )
+                fig_shower.update_traces(
+                    hovertemplate="<b>Shower Run Detected</b><br><b>Time:</b> %{x}<br><b>Energy:</b> %{y:.2f} kWh<extra></extra>",
+                    hoverlabel=dict(bgcolor="#ffebee", font_size=16)
+                )
+                st.plotly_chart(fig_shower, use_container_width=True)
+                
+                st.dataframe(show_df[["Time of Run", "day_name", "Consumption", "Cost (Inc. VAT)"]].rename(columns={"day_name": "Day"}), use_container_width=True)
+            else:
+                st.success("No heavy isolated shower spikes detected during this filter window.")
+                
+        with res_col2:
+            st.markdown(f"#### 🍵 Detected Kettle Boil Surges ({len(kettle_runs)})")
+            if not kettle_runs.empty:
+                kettle_df = kettle_runs[["reading_at", "day_name", "net_spike_above_baseline", "run_cost"]].copy()
+                kettle_df["Time of Run"] = kettle_df["reading_at"].dt.strftime("%d %b %Y (%H:%M)")
+                kettle_df["Boil Surge"] = kettle_df["net_spike_above_baseline"].map(lambda x: f"+{x:.2f} kWh")
+                kettle_df["Cost (Inc. VAT)"] = kettle_df["run_cost"].map(lambda x: f"€{x:.2f}")
+                
+                fig_kettle = px.scatter(
+                    kettle_df, 
+                    x="reading_at", 
+                    y="net_spike_above_baseline", 
+                    size="net_spike_above_baseline", 
+                    color="run_cost",
+                    color_continuous_scale="Viridis",
+                    labels={"reading_at": "Date & Time", "net_spike_above_baseline": "Boil Surge Size (kWh)"}
+                )
+                fig_kettle.update_traces(
+                    hovertemplate="<b>Kettle Run Detected</b><br><b>Time:</b> %{x}<br><b>Surge:</b> +%{y:.2f} kWh<extra></extra>",
+                    hoverlabel=dict(bgcolor="#e8f5e9", font_size=16)
+                )
+                st.plotly_chart(fig_kettle, use_container_width=True)
+                
+                st.dataframe(kettle_df[["Time of Run", "day_name", "Boil Surge", "Cost (Inc. VAT)"]].rename(columns={"day_name": "Day"}), use_container_width=True)
+            else:
+                st.info("No distinct isolated kettle runs identified in this period.")
 
 else:
     st.warning("Please upload a valid smart meter interval data file or select 'Use Sample Demo Data' in the sidebar to populate the dashboard!")
