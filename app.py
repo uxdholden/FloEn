@@ -223,32 +223,33 @@ def generate_demo_data() -> pd.DataFrame:
 # --- DYNAMIC COST CALCULATION ---
 def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
     """
-    Applies custom tariff bands to each reading based on the time of day.
-    Standard Smart Meter Tariff structure (Day / Night / Peak):
-      - Night: 23:00 - 08:00
-      - Peak: 17:00 - 19:00
-      - Day: 08:00 - 17:00 and 19:00 - 23:00
+    Applies custom tariff bands to each reading based on the configured rates.
+    Supports either a flat 24-hour rate or dynamic Smart Day/Night/Peak bands.
     """
     df = df.copy()
     df["hour"] = df["reading_at"].dt.hour
     
-    # Assign Tariff Categories
-    conditions = [
-        (df["hour"] >= 23) | (df["hour"] < 8),                     # Night (11 PM - 8 AM)
-        (df["hour"] >= 17) & (df["hour"] < 19),                     # Peak (5 PM - 7 PM)
-    ]
-    choices = ["Night", "Peak"]
-    df["tariff_band"] = np.select(conditions, choices, default="Day")
-    
-    # Map rates to bands
-    rate_map = {
-        "Day": rates["day_rate"],
-        "Night": rates["night_rate"],
-        "Peak": rates["peak_rate"]
-    }
-    df["tariff_rate"] = df["tariff_band"].map(rate_map)
+    if rates["type"] == "flat":
+        df["tariff_band"] = "24hr Flat"
+        df["tariff_rate"] = rates["flat_rate"]
+    else:
+        # Assign Smart Tariff Categories
+        conditions = [
+            (df["hour"] >= 23) | (df["hour"] < 8),                     # Night (11 PM - 8 AM)
+            (df["hour"] >= 17) & (df["hour"] < 19),                     # Peak (5 PM - 7 PM)
+        ]
+        choices = ["Night", "Peak"]
+        df["tariff_band"] = np.select(conditions, choices, default="Day")
+        
+        # Map rates to bands
+        rate_map = {
+            "Day": rates["day_rate"],
+            "Night": rates["night_rate"],
+            "Peak": rates["peak_rate"]
+        }
+        df["tariff_rate"] = df["tariff_band"].map(rate_map)
+        
     df["cost"] = df["estimated_kwh"] * df["tariff_rate"]
-    
     return df
 
 
@@ -270,14 +271,67 @@ if data_option == "Upload My Own File":
     )
 
 # --- TARIFF / COST SIDEBAR ---
-st.sidebar.header("💰 Tariff Settings (€)")
-rates = {
-    "day_rate": st.sidebar.number_input("Day Rate (€/kWh)", min_value=0.0, max_value=2.0, value=0.38, step=0.01, format="%.3f"),
-    "night_rate": st.sidebar.number_input("Night Rate (€/kWh)", min_value=0.0, max_value=2.0, value=0.20, step=0.01, format="%.3f"),
-    "peak_rate": st.sidebar.number_input("Peak Rate (€/kWh)", min_value=0.0, max_value=2.0, value=0.46, step=0.01, format="%.3f"),
-    "standing_charge": st.sidebar.number_input("Daily Standing Charge (€/day)", min_value=0.0, max_value=10.0, value=0.85, step=0.05),
-    "vat_rate": st.sidebar.number_input("VAT Rate (%)", min_value=0.0, max_value=100.0, value=9.0, step=0.5) / 100.0
-}
+st.sidebar.header("💰 Tariff Settings")
+
+tariff_style = st.sidebar.selectbox(
+    "Select Tariff Type:",
+    ["24-Hour Flat Tariff", "Smart (Day/Night/Peak) Tariff"],
+    index=0
+)
+
+rates = {}
+if tariff_style == "24-Hour Flat Tariff":
+    rates["type"] = "flat"
+    flat_rate_cent = st.sidebar.number_input(
+        "Flat Rate (Cent / kWh)", 
+        min_value=0.0, 
+        max_value=200.0, 
+        value=26.41, 
+        step=0.1, 
+        format="%.2f",
+        help="Your flat electricity usage unit fee. Converts automatically to Euros."
+    )
+    rates["flat_rate"] = flat_rate_cent / 100.0  # Convert Cent to Euro
+else:
+    rates["type"] = "smart"
+    day_rate_cent = st.sidebar.number_input("Day Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=38.00, step=0.1, format="%.2f")
+    night_rate_cent = st.sidebar.number_input("Night Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=20.00, step=0.1, format="%.2f")
+    peak_rate_cent = st.sidebar.number_input("Peak Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=46.00, step=0.1, format="%.2f")
+    
+    rates["day_rate"] = day_rate_cent / 100.0
+    rates["night_rate"] = night_rate_cent / 100.0
+    rates["peak_rate"] = peak_rate_cent / 100.0
+
+# Fixed Standing and PSO Charges
+st.sidebar.markdown("**Fixed & Standing Charges (€)**")
+annual_standing = st.sidebar.number_input(
+    "Annual Standing Charge (€)", 
+    min_value=0.0, 
+    max_value=1000.0, 
+    value=270.45, 
+    step=1.0,
+    help="Your annual fixed provider fee. E.g., €270.45"
+)
+annual_pso = st.sidebar.number_input(
+    "Annual PSO Levy (€)", 
+    min_value=0.0, 
+    max_value=200.0, 
+    value=19.10, 
+    step=0.5,
+    help="Your annual Public Service Obligation levy fee. E.g., €19.10"
+)
+vat_rate = st.sidebar.number_input(
+    "VAT Rate (%)", 
+    min_value=0.0, 
+    max_value=100.0, 
+    value=9.0, 
+    step=0.5
+) / 100.0
+
+# Calculate combined daily standing charge (Standing Charge + PSO Levy converted to daily)
+daily_standing_rate = (annual_standing + annual_pso) / 365.25
+rates["daily_standing_charge"] = daily_standing_rate
+rates["vat_rate"] = vat_rate
 
 # --- LOAD DATA ---
 df_raw = None
@@ -320,7 +374,7 @@ if df_raw is not None and not df_raw.empty:
 
     # Aggregate Standing Charge Costs (based on filtered days)
     unique_days = df_filtered["date_only"].nunique()
-    total_standing_charge = unique_days * rates["standing_charge"]
+    total_standing_charge = unique_days * rates["daily_standing_charge"]
     
     # 2. Key Metrics Calculations (Filtered)
     total_kwh = df_filtered["estimated_kwh"].sum()
@@ -346,7 +400,7 @@ if df_raw is not None and not df_raw.empty:
         st.metric(
             label="Total Cost (Inc. VAT & Standing)", 
             value=f"€{gross_cost:,.2f}", 
-            help=f"Includes usage charges, standing charges (€{total_standing_charge:.2f}), and VAT ({rates['vat_rate']*100:.1f}%)."
+            help=f"Includes usage charges, daily standing charges + PSO Levy (totaling €{total_standing_charge:.2f}), and VAT ({rates['vat_rate']*100:.1f}%)."
         )
     with col3:
         st.metric(
@@ -383,7 +437,7 @@ if df_raw is not None and not df_raw.empty:
             ).reset_index()
             
             # Calculate standing charges and VAT per month
-            monthly_summary["standing_charges"] = monthly_summary["days_in_dataset"] * rates["standing_charge"]
+            monthly_summary["standing_charges"] = monthly_summary["days_in_dataset"] * rates["daily_standing_charge"]
             monthly_summary["total_cost_inc_vat"] = (monthly_summary["usage_cost"] + monthly_summary["standing_charges"]) * (1 + rates["vat_rate"])
             
             has_current_month = current_year_month in monthly_summary["year_month"].values
@@ -492,7 +546,7 @@ if df_raw is not None and not df_raw.empty:
             ).reset_index()
             
             # Daily standing charge + VAT application
-            daily_summary["total_cost_inc_vat"] = (daily_summary["usage_cost"] + rates["standing_charge"]) * (1 + rates["vat_rate"])
+            daily_summary["total_cost_inc_vat"] = (daily_summary["usage_cost"] + rates["daily_standing_charge"]) * (1 + rates["vat_rate"])
             
             m_col1, m_col2 = st.columns(2)
             
@@ -544,7 +598,7 @@ if df_raw is not None and not df_raw.empty:
         st.subheader("Usage Profile by Hour of Day & Weekday")
         
         # Diurnal (hourly) usage profile (Filtered)
-        hourly_summary = df_filtered.groupby(["hour_of_day", "tariff_band"]).agg(
+        hourly_summary = df_filtered.groupby(["hour_of_day"]).agg(
             avg_kwh=("estimated_kwh", "mean"),
             total_kwh=("estimated_kwh", "sum")
         ).reset_index()
@@ -576,36 +630,43 @@ if df_raw is not None and not df_raw.empty:
             st.plotly_chart(fig_hourly, use_container_width=True)
             
         with h_col2:
-            st.markdown("#### Cost Impact by Tariff Band")
-            tariff_breakdown = df_filtered.groupby("tariff_band").agg(
-                total_kwh=("estimated_kwh", "sum"),
-                total_cost=("cost", "sum")
+            st.markdown("#### Consumption Share by Time Window")
+            # Even for flat rates, it's very useful to see when you consume power (mapped to standard Day/Night/Peak hours)
+            df_temp = df_filtered.copy()
+            conditions_temp = [
+                (df_temp["hour_of_day"] >= 23) | (df_temp["hour_of_day"] < 8),
+                (df_temp["hour_of_day"] >= 17) & (df_temp["hour_of_day"] < 19)
+            ]
+            df_temp["virtual_band"] = np.select(conditions_temp, ["Night Time", "Peak Time (17-19)"], default="Standard Day")
+            
+            temp_breakdown = df_temp.groupby("virtual_band").agg(
+                total_kwh=("estimated_kwh", "sum")
             ).reset_index()
             
             fig_pie = px.pie(
-                tariff_breakdown, 
+                temp_breakdown, 
                 values="total_kwh", 
-                names="tariff_band",
-                color="tariff_band",
-                color_discrete_map={"Day": "#FFCA28", "Night": "#5C6BC0", "Peak": "#EF5350"},
+                names="virtual_band",
+                color="virtual_band",
+                color_discrete_map={"Standard Day": "#FFCA28", "Night Time": "#5C6BC0", "Peak Time (17-19)": "#EF5350"},
                 hole=0.4
             )
             fig_pie.update_traces(textinfo="percent+label")
-            fig_pie.update_layout(legend_title="Tariff Category")
+            fig_pie.update_layout(legend_title="Time Window")
             st.plotly_chart(fig_pie, use_container_width=True)
             
         st.markdown("---")
-        st.markdown("#### ⚡ Peak Usage Diagnostics")
+        st.markdown("#### ⚡ Demand Shift & Load Insights")
         p_col1, p_col2 = st.columns(2)
         
         with p_col1:
             # Highlight Peak bands
-            peak_only = df_filtered[df_filtered["tariff_band"] == "Peak"]
+            peak_only = df_filtered[(df_filtered["hour_of_day"] >= 17) & (df_filtered["hour_of_day"] < 19)]
             avg_peak_load = peak_only["read_value_kw"].mean() if not peak_only.empty else 0.0
             st.markdown(
                 f"""
                 * **Peak Period (17:00 - 19:00):** Your average demand during evening peak window is **{avg_peak_load:.2f} kW**.
-                * **Day/Night Load Shift Potential:** Shifting appliances (washing machine, dishwasher, EV charging) from Peak/Day slots to **Night ({rates['night_rate']:.3f}€/kWh)** or **Day ({rates['day_rate']:.3f}€/kWh)** will substantially drop your monthly bills.
+                * **Bill-Saving Insights:** Even though you are on a **24-Hour Flat Tariff ({rates.get('flat_rate', 0)*100:.2f} c/kWh)**, you can use these charts to simulate potential savings if you were to shift major appliances to night hours and switch to a Time-of-Use smart tariff.
                 """
             )
             
@@ -623,7 +684,7 @@ if df_raw is not None and not df_raw.empty:
         # Line plot of daily usage (Filtered)
         daily_kwh = df_filtered.groupby("date_only").agg(
             total_kwh=("estimated_kwh", "sum"),
-            cost_inc_standing=("cost", lambda x: (x.sum() + rates["standing_charge"]) * (1 + rates["vat_rate"]))
+            cost_inc_standing=("cost", lambda x: (x.sum() + rates["daily_standing_charge"]) * (1 + rates["vat_rate"]))
         ).reset_index()
         
         fig_daily = px.area(
