@@ -1,298 +1,246 @@
-import streamlit as st
+import csv
+import io
+import os
+from datetime import datetime
+
 import pandas as pd
-from datetime import datetime, date, timedelta
-import re
-
-st.set_page_config(page_title="My Flogas Dashboard", layout="wide", initial_sidebar_state="expanded")
-
-if "bills" not in st.session_state:
-    today = date.today()
-    first_of_month = today.replace(day=1)
-    st.session_state.bills = pd.DataFrame([
-        {"bill_date": str(first_of_month), "due_date": str(today + timedelta(days=12)), "amount": 124.80, "status": "Due", "notes": "Sample current bill"},
-        {"bill_date": str(first_of_month - timedelta(days=31)), "due_date": str(first_of_month - timedelta(days=18)), "amount": 98.40, "status": "Paid", "notes": "Sample previous bill"},
-    ])
-
-if "meter_readings" not in st.session_state:
-    st.session_state.meter_readings = pd.DataFrame(columns=["reading_at", "meter_type", "reading_value", "source"])
-
-if "reminders" not in st.session_state:
-    st.session_state.reminders = pd.DataFrame([
-        {"title": "Submit meter reading", "due_date": str(date.today() + timedelta(days=7)), "status": "Open", "notes": "Avoid estimated bill"},
-        {"title": "Review latest bill", "due_date": str(date.today() + timedelta(days=3)), "status": "Open", "notes": "Check cost and projected trend"},
-    ])
+import streamlit as st
 
 
-def parse_interval_csv(uploaded_file):
-    raw = uploaded_file.read().decode("utf-8", errors="ignore")
-    pattern = re.compile(
-        r"(?P<mprn>\d{11})\s*"
-        r"(?P<serial>\d+)\s*"
-        r"(?P<value>\d+\.\d{3})\s*"
-        r"(?P<read_type>Active Import Interval kW)\s*"
-        r"(?P<date>\d{2}-\d{2}-\d{4})\s+"
-        r"(?P<time>\d{4})"
-    )
+def get_secret(name: str, default: str | None = None):
+    if name in st.secrets:
+        return st.secrets[name]
+    return os.getenv(name, default)
+
+
+def parse_uploaded_csv(uploaded_file) -> list[dict]:
+    raw = uploaded_file.getvalue()
+    text = raw.decode("utf-8-sig", errors="replace")
+    return list(csv.DictReader(io.StringIO(text)))
+
+
+def aggregate_daily(records):
+    date_candidates = [
+        "Read Date and End Time",
+        "Read Date",
+        "Date",
+        "Interval End",
+        "Meter Read Date",
+        "Timestamp",
+    ]
+    value_candidates = [
+        "Read Value",
+        "Consumption",
+        "kWh",
+        "Active Import Interval (kW)",
+        "Interval Read",
+        "Usage",
+    ]
+
+    def parse_date(value: str):
+        if not value:
+            return None
+        for fmt in (
+            "%d-%m-%Y %H:%M",
+            "%d/%m/%Y %H:%M",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%d-%m-%Y",
+            "%d/%m/%Y",
+            "%Y-%m-%d",
+        ):
+            try:
+                return datetime.strptime(str(value).strip(), fmt).date()
+            except Exception:
+                pass
+        return None
+
+    def parse_float(value: str):
+        if value is None:
+            return None
+        try:
+            return float(str(value).strip().replace(",", ""))
+        except Exception:
+            return None
+
+    date_key = next((k for k in date_candidates if records and k in records[0]), None)
+    value_key = next((k for k in value_candidates if records and k in records[0]), None)
+
+    if not date_key or not value_key:
+        return [], date_key, value_key
+
+    daily = {}
+    for row in records:
+        day = parse_date(row.get(date_key, ""))
+        val = parse_float(row.get(value_key, ""))
+        if day is None or val is None:
+            continue
+        daily.setdefault(str(day), 0.0)
+        daily[str(day)] += val
 
     rows = []
-    for m in pattern.finditer(raw):
-        rows.append({
-            "mprn": m.group("mprn"),
-            "meter_serial": m.group("serial"),
-            "read_value_kw": float(m.group("value")),
-            "date": m.group("date"),
-            "time": m.group("time"),
-        })
+    for day in sorted(daily):
+        kwh = round(daily[day], 4)
+        rows.append(
+            {
+                "date": day,
+                "kwh": kwh,
+                "avg_kwh_per_hour": round(kwh / 24.0, 4),
+            }
+        )
+    return rows, date_key, value_key
 
-    if not rows:
-        fallback_lines = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if "Active Import Interval kW" not in line:
-                continue
-            m = re.search(
-                r"(?P<mprn>\d{11})\s*(?P<serial>\d+)\s*(?P<value>\d+\.\d{3})\s*Active Import Interval kW\s*(?P<date>\d{2}-\d{2}-\d{4})\s+(?P<time>\d{4})",
-                line,
-            )
-            if m:
-                fallback_lines.append({
-                    "mprn": m.group("mprn"),
-                    "meter_serial": m.group("serial"),
-                    "read_value_kw": float(m.group("value")),
-                    "date": m.group("date"),
-                    "time": m.group("time"),
-                })
-        rows = fallback_lines
 
+def add_costs(daily_rows, unit_rate, standing_charge):
+    if not daily_rows:
+        return []
+
+    avg_daily = sum(r["kwh"] for r in daily_rows) / len(daily_rows)
+    projected_month_cost = (avg_daily * unit_rate + standing_charge) * 30
+
+    out = []
+    for row in daily_rows:
+        daily_cost = row["kwh"] * unit_rate + standing_charge
+        out.append(
+            {
+                **row,
+                "unit_rate": round(unit_rate, 6),
+                "standing_charge": round(standing_charge, 6),
+                "daily_cost": round(daily_cost, 4),
+                "projected_month_cost": round(projected_month_cost, 2),
+            }
+        )
+    return out
+
+
+def records_to_df(rows):
     if not rows:
         return pd.DataFrame()
-
     df = pd.DataFrame(rows)
-    df["reading_at"] = pd.to_datetime(df["date"] + " " + df["time"], format="%d-%m-%Y %H%M", errors="coerce")
-    df = df.dropna(subset=["reading_at"]).sort_values("reading_at")
-    df["interval_hours"] = 0.5
-    df["estimated_kwh"] = df["read_value_kw"] * df["interval_hours"]
-    df["date_only"] = df["reading_at"].dt.date
-    return df[["mprn", "meter_serial", "reading_at", "read_value_kw", "estimated_kwh", "date_only"]]
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.sort_values("date")
+    return df
 
 
-def add_bill(bill_date, due_date, amount, status, notes):
-    new_row = pd.DataFrame([{
-        "bill_date": str(bill_date),
-        "due_date": str(due_date),
-        "amount": float(amount),
-        "status": status,
-        "notes": notes,
-    }])
-    st.session_state.bills = pd.concat([new_row, st.session_state.bills], ignore_index=True)
+st.set_page_config(page_title="FloEn", layout="wide")
+st.title("FloEn")
+st.caption("Personal energy cost tracker using manual ESB CSV upload")
 
+required = ["APP_PASSWORD", "FLOGAS_UNIT_RATE", "FLOGAS_STANDING_CHARGE_DAILY"]
+missing = [k for k in required if get_secret(k) in (None, "")]
 
-def add_reading(reading_at, meter_type, reading_value, source):
-    new_row = pd.DataFrame([{
-        "reading_at": reading_at,
-        "meter_type": meter_type,
-        "reading_value": float(reading_value),
-        "source": source,
-    }])
-    st.session_state.meter_readings = pd.concat([new_row, st.session_state.meter_readings], ignore_index=True)
+if missing:
+    st.error("Missing required secrets: " + ", ".join(missing))
+    st.info("Add them in Streamlit Secrets before using the app.")
+    st.stop()
 
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
 
-def add_reminder(title, due_date, status, notes):
-    new_row = pd.DataFrame([{
-        "title": title.strip(),
-        "due_date": str(due_date),
-        "status": status,
-        "notes": notes,
-    }])
-    st.session_state.reminders = pd.concat([st.session_state.reminders, new_row], ignore_index=True)
+if "df" not in st.session_state:
+    st.session_state.df = pd.DataFrame()
 
+if "raw_records" not in st.session_state:
+    st.session_state.raw_records = []
 
-def overview_tab():
-    st.subheader("Overview")
+if "source_name" not in st.session_state:
+    st.session_state.source_name = None
 
-    bills = st.session_state.bills.copy()
-    readings = st.session_state.meter_readings.copy()
-    reminders = st.session_state.reminders.copy()
+app_password = get_secret("APP_PASSWORD")
 
-    balance_due = bills.loc[bills["status"].fillna("").str.lower().eq("due"), "amount"].sum() if not bills.empty else 0
-    latest_bill = bills.iloc[0]["bill_date"] if not bills.empty else "No data"
-    latest_read = readings.iloc[0]["reading_at"] if not readings.empty else "No data"
-    open_reminders = int((reminders["status"].fillna("").str.lower() != "done").sum()) if not reminders.empty else 0
+if not st.session_state.authenticated:
+    st.subheader("App Login")
+    entered_password = st.text_input("Enter app password", type="password")
+    login_clicked = st.button("Unlock app", type="primary")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Balance due", f"€{balance_due:,.2f}")
-    c2.metric("Latest bill", str(latest_bill))
-    c3.metric("Latest reading", str(latest_read)[:16])
-    c4.metric("Open reminders", open_reminders)
+    if login_clicked:
+        if entered_password == app_password:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
 
-    left, right = st.columns([1.1, 1])
-    with left:
-        st.markdown("### Latest bills")
-        bill_view = bills[["bill_date", "due_date", "amount", "status", "notes"]] if not bills.empty else pd.DataFrame()
-        st.dataframe(bill_view, use_container_width=True, hide_index=True)
+    st.stop()
 
-    with right:
-        st.markdown("### Recent readings")
-        read_view = readings[["reading_at", "meter_type", "reading_value", "source"]].head(25) if not readings.empty else pd.DataFrame()
-        st.dataframe(read_view, use_container_width=True, hide_index=True)
+unit_rate = float(get_secret("FLOGAS_UNIT_RATE", "0.0809"))
+standing_charge = float(get_secret("FLOGAS_STANDING_CHARGE_DAILY", "0.4142"))
 
-    if not readings.empty:
-        chart_df = readings.copy()
-        chart_df["reading_at"] = pd.to_datetime(chart_df["reading_at"], errors="coerce")
-        chart_df = chart_df.dropna(subset=["reading_at"]).sort_values("reading_at")
-        st.markdown("### Reading trend")
-        st.line_chart(chart_df.set_index("reading_at")["reading_value"])
+with st.sidebar:
+    st.header("Upload")
+    uploaded_file = st.file_uploader("Upload ESB CSV file", type=["csv"])
+    st.caption("Download your usage file from ESB manually, then upload it here.")
+    st.divider()
+    st.header("Rates")
+    st.write(f"Unit rate: €{unit_rate:.4f} per kWh")
+    st.write(f"Standing charge: €{standing_charge:.4f} per day")
 
+if uploaded_file is not None:
+    try:
+        records = parse_uploaded_csv(uploaded_file)
+        daily_rows, detected_date_key, detected_value_key = aggregate_daily(records)
 
-def bills_tab():
-    st.subheader("Bills")
+        if not daily_rows:
+            st.error("Could not detect usable date/value columns in the uploaded CSV.")
+            if records:
+                st.write("Detected columns:")
+                st.write(list(records[0].keys()))
+            st.stop()
 
-    with st.form("add_bill"):
-        c1, c2, c3, c4 = st.columns(4)
-        bill_date = c1.date_input("Bill date", value=date.today())
-        due_date = c2.date_input("Due date", value=date.today() + timedelta(days=14))
-        amount = c3.number_input("Amount (€)", min_value=0.0, step=0.01, format="%.2f")
-        status = c4.selectbox("Status", ["Due", "Paid", "Planned"])
-        notes = st.text_input("Notes")
-        submitted = st.form_submit_button("Save bill")
-        if submitted:
-            add_bill(bill_date, due_date, amount, status, notes)
-            st.success("Bill saved")
+        cost_rows = add_costs(daily_rows, unit_rate, standing_charge)
+        st.session_state.df = records_to_df(cost_rows)
+        st.session_state.raw_records = records
+        st.session_state.source_name = uploaded_file.name
+        st.session_state.detected_date_key = detected_date_key
+        st.session_state.detected_value_key = detected_value_key
+        st.success(f"Loaded file: {uploaded_file.name}")
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
+        st.stop()
 
-    bills = st.session_state.bills.copy()
-    st.dataframe(bills, use_container_width=True, hide_index=True)
+if st.session_state.df.empty:
+    st.info("Unlock the app, then upload your ESB CSV file to view usage and costs.")
+    st.stop()
 
-    if not bills.empty:
-        chart_df = bills.copy()
-        chart_df["bill_date"] = pd.to_datetime(chart_df["bill_date"], errors="coerce")
-        chart_df = chart_df.dropna(subset=["bill_date"]).sort_values("bill_date")
-        st.markdown("### Bill amounts")
-        st.bar_chart(chart_df.set_index("bill_date")["amount"])
+df = st.session_state.df
+latest = df.iloc[-1]
+avg_daily_cost = df["daily_cost"].mean()
+avg_daily_kwh = df["kwh"].mean()
+projected_month = latest["projected_month_cost"]
+avg_hourly = avg_daily_kwh / 24 if avg_daily_kwh else 0
 
+st.write(f"Source file: {st.session_state.source_name}")
+st.write(
+    f"Detected date column: `{st.session_state.detected_date_key}` | "
+    f"Detected value column: `{st.session_state.detected_value_key}`"
+)
 
-def readings_tab():
-    st.subheader("Meter readings")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Latest Daily Cost", f"€{latest['daily_cost']:.2f}")
+c2.metric("Projected Month", f"€{projected_month:.2f}")
+c3.metric("Average Daily Usage", f"{avg_daily_kwh:.2f} kWh")
+c4.metric("Average Hourly Usage", f"{avg_hourly:.2f} kWh")
 
-    with st.expander("Add manual reading"):
-        with st.form("add_manual_reading"):
-            c1, c2 = st.columns(2)
-            reading_date = c1.date_input("Reading date", value=date.today(), key="manual_reading_date")
-            reading_time = c2.time_input("Reading time", value=datetime.now().time().replace(second=0, microsecond=0), key="manual_reading_time")
-            c3, c4, c5 = st.columns([1, 1, 1.2])
-            meter_type = c3.selectbox("Meter type", ["Electricity", "Gas", "LPG", "Other"])
-            reading_value = c4.number_input("Reading value", min_value=0.0, step=0.001, format="%.3f")
-            source = c5.text_input("Source", value="Manual")
-            submitted = st.form_submit_button("Save reading")
-            if submitted:
-                reading_at = datetime.combine(reading_date, reading_time).strftime("%Y-%m-%d %H:%M")
-                add_reading(reading_at, meter_type, reading_value, source)
-                st.success("Reading saved")
+tab1, tab2, tab3 = st.tabs(["Costs", "Usage", "Data"])
 
-    readings = st.session_state.meter_readings.copy()
-    st.dataframe(readings, use_container_width=True, hide_index=True)
-
-    if not readings.empty:
-        chart_df = readings.copy()
-        chart_df["reading_at"] = pd.to_datetime(chart_df["reading_at"], errors="coerce")
-        chart_df = chart_df.dropna(subset=["reading_at"]).sort_values("reading_at")
-        st.markdown("### Imported and manual reading trend")
-        st.line_chart(chart_df.set_index("reading_at")["reading_value"])
-
-
-def reminders_tab():
-    st.subheader("Reminders")
-
-    with st.form("add_reminder"):
-        c1, c2, c3 = st.columns(3)
-        title = c1.text_input("Task")
-        due_date = c2.date_input("Due date", value=date.today() + timedelta(days=7))
-        status = c3.selectbox("Status", ["Open", "Done"])
-        notes = st.text_input("Notes")
-        submitted = st.form_submit_button("Save reminder")
-        if submitted and title.strip():
-            add_reminder(title, due_date, status, notes)
-            st.success("Reminder saved")
-
-    reminders = st.session_state.reminders.copy()
-    st.dataframe(reminders, use_container_width=True, hide_index=True)
-
-
-def contacts_tab():
-    st.subheader("Contacts")
-    st.markdown(
-        """
-- Natural Gas & Electricity: 041 214 9500
-- LPG Support: 041 214 9600
-- Customer support email: customersupport@flogas.ie
-- LPG support email: lpgsupport@flogas.ie
-        """
+with tab1:
+    st.subheader("Daily Cost Trend")
+    st.line_chart(df.set_index("date")["daily_cost"])
+    st.dataframe(
+        df[["date", "kwh", "daily_cost", "projected_month_cost"]],
+        use_container_width=True,
     )
-    st.info("This is a personal companion dashboard and does not log into the official Flogas portal.")
 
+with tab2:
+    st.subheader("Usage Trend")
+    st.line_chart(df.set_index("date")["kwh"])
+    st.bar_chart(df.set_index("date")["avg_kwh_per_hour"])
 
-def sidebar_imports():
-    st.sidebar.markdown("### Import interval CSV")
-    upload = st.sidebar.file_uploader("Upload Flogas / smart meter CSV", type=["csv", "txt"])
-    if upload is None:
-        return
+with tab3:
+    st.subheader("Processed Data")
+    st.dataframe(df, use_container_width=True)
 
-    parsed = parse_interval_csv(upload)
-    if parsed.empty:
-        st.sidebar.warning("Could not parse interval readings from that file.")
-        st.sidebar.caption("Expected format includes MPRN, meter serial, kW value, and date/time.")
-        return
-
-    st.sidebar.success(f"Parsed {len(parsed):,} rows")
-    st.sidebar.caption("Estimated kWh uses 30-minute intervals: kW × 0.5")
-
-    with st.expander("Imported preview", expanded=False):
-        st.dataframe(parsed.tail(100), use_container_width=True, hide_index=True)
-        daily = parsed.groupby("date_only", as_index=False)["estimated_kwh"].sum()
-        st.markdown("### Estimated daily usage")
-        st.line_chart(daily.set_index("date_only")["estimated_kwh"])
-
-    if st.sidebar.button("Import parsed readings", use_container_width=True):
-        rows = pd.DataFrame([
-            {
-                "reading_at": r.reading_at.strftime("%Y-%m-%d %H:%M"),
-                "meter_type": "Electricity",
-                "reading_value": float(r.read_value_kw),
-                "source": "CSV import",
-            }
-            for r in parsed.itertuples(index=False)
-        ])
-        st.session_state.meter_readings = pd.concat([rows, st.session_state.meter_readings], ignore_index=True)
-        st.sidebar.success(f"Imported {len(rows):,} readings")
-
-
-def main():
-    st.title("My Flogas Dashboard")
-    st.caption("Bills, readings, reminders, and interval usage imports")
-
-    with st.sidebar:
-        st.header("Navigation")
-        page = st.radio(
-            "Go to",
-            ["Overview", "Readings", "Bills", "Reminders", "Contacts"],
-            index=0,
-        )
-        st.markdown("---")
-        st.caption("Personal dashboard")
-        st.caption("Session-based storage")
-
-    sidebar_imports()
-
-    if page == "Overview":
-        overview_tab()
-    elif page == "Readings":
-        readings_tab()
-    elif page == "Bills":
-        bills_tab()
-    elif page == "Reminders":
-        reminders_tab()
-    elif page == "Contacts":
-        contacts_tab()
-
-
-if __name__ == "__main__":
-    main()
+    if st.session_state.raw_records:
+        raw_df = pd.DataFrame(st.session_state.raw_records)
+        st.subheader("Raw Uploaded Rows")
+        st.dataframe(raw_df, use_container_width=True)
