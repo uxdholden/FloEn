@@ -1,15 +1,13 @@
 import io
-import os
 import re
 import calendar
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
 
-# Set page configuration
 st.set_page_config(
     page_title="Smart Meter Cost & Analytics Dashboard",
     page_icon="⚡",
@@ -17,7 +15,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- INJECT CUSTOM LARGE CARD STYLE CSS ---
 st.markdown("""
 <style>
     .metric-container {
@@ -55,11 +52,6 @@ st.markdown("""
 
 
 def parse_wide_csv(raw: str) -> pd.DataFrame:
-    """
-    Parses the wide daily-pivot format exported by some ESB tools:
-      MPRN, Meter Serial Number, Date, 00:00:00, 00:30:00, ..., 23:30:00
-    Each row = one day; 48 time columns hold kWh values for each half-hour slot.
-    """
     try:
         df = pd.read_csv(io.StringIO(raw), dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
@@ -100,13 +92,7 @@ def parse_wide_csv(raw: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# --- UTILITY PARSER FUNCTION ---
 def parse_interval_csv(uploaded_file) -> pd.DataFrame:
-    """
-    Parses electricity smart meter interval data files (such as ESB HDF files).
-    Handles files with leading metadata headers, flexible column names,
-    long interval CSV/text formats, and wide daily-pivot CSV files.
-    """
     if hasattr(uploaded_file, "read"):
         raw_bytes = uploaded_file.read()
     else:
@@ -117,7 +103,6 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
     else:
         raw = str(raw_bytes)
 
-    # ── Wide daily-pivot format: MPRN, Serial, Date, 00:00:00 … 23:30:00 ──
     first_line = raw.splitlines()[0] if raw.splitlines() else ""
     if re.search(r"(?i)\bdate\b", first_line) and re.search(r"\d{2}:\d{2}:\d{2}", raw):
         wide_result = parse_wide_csv(raw)
@@ -156,7 +141,6 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
 
         return df[["mprn", "meter_serial", "reading_at", "read_value_kw", "estimated_kwh", "date_only"]]
 
-    # Extract Data using Pandas (CSV Mode)
     try:
         lines = raw.splitlines()
         header_idx = -1
@@ -184,21 +168,16 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
                 "meter_serial": csv_df[serial_col].astype(str).str.strip() if serial_col else "",
                 "read_value": pd.to_numeric(csv_df[value_col], errors="coerce"),
                 "read_type": csv_df[type_col].astype(str).str.strip() if type_col else "Active Import Interval (kWh)",
-                "reading_at": pd.to_datetime(
-                    csv_df[date_col],
-                    errors="coerce",
-                ),
+                "reading_at": pd.to_datetime(csv_df[date_col], errors="coerce"),
             })
 
             if type_col:
-                df = df[
-                    df["read_type"].str.contains(
-                        r"Active Import Interval\s*(?:\((?:kW|kWh)\))?",
-                        regex=True,
-                        na=False,
-                        case=False
-                    )
-                ]
+                df = df[df["read_type"].str.contains(
+                    r"Active Import Interval\s*(?:\((?:kW|kWh)\))?",
+                    regex=True,
+                    na=False,
+                    case=False
+                )]
 
             parsed = finalize(df)
             if not parsed.empty:
@@ -206,7 +185,6 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
     except Exception:
         pass
 
-    # Fallback Regex Parser
     pattern = re.compile(
         r"(?P<mprn>\d{11})[,\s\t;]+"
         r"(?P<serial>[A-Za-z0-9_-]+)[,\s\t;]+"
@@ -237,43 +215,15 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
         })
 
     if not rows:
-        fallback_lines = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if "Active Import" not in line:
-                continue
-            m = re.search(pattern, line)
-            if m:
-                date_str = m.group("date").replace("/", "-")
-                time_text = m.group("time").replace(":", "")
-                if len(time_text) > 4:
-                    time_text = time_text[:4]
-                fallback_lines.append({
-                    "mprn": m.group("mprn"),
-                    "meter_serial": m.group("serial"),
-                    "read_value_kw": float(m.group("value")),
-                    "read_type": m.group("read_type"),
-                    "reading_at": pd.to_datetime(
-                        f"{date_str} {time_text}",
-                        format="%d-%m-%Y %H%M",
-                        errors="coerce",
-                    ),
-                })
-        rows = fallback_lines
-
-    if not rows:
         return pd.DataFrame()
 
     return finalize(pd.DataFrame(rows))
 
 
-# --- DEMO DATA GENERATOR ---
 def generate_demo_data() -> pd.DataFrame:
-    """Generates synthetic half-hourly smart meter interval data for demo purposes."""
     np.random.seed(42)
     end_date = datetime.now()
     start_date = end_date - timedelta(days=90)
-
     date_range = pd.date_range(start=start_date, end=end_date, freq="30min")
 
     rows = []
@@ -310,17 +260,12 @@ def generate_demo_data() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# --- DYNAMIC COST CALCULATION ---
 def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
-    """
-    Applies custom tariff bands to each reading based on the configured rates.
-    Supports either a flat 24-hour rate or dynamic Smart Day/Night/Peak bands.
-    """
     df = df.copy()
     df["hour"] = df["reading_at"].dt.hour
 
     if rates["type"] == "flat":
-        df["tariff_band"] = "24hr Flat"
+        df["tariff_band"] = "Flat"
         df["tariff_rate"] = rates["flat_rate"]
     else:
         conditions = [
@@ -341,13 +286,11 @@ def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
     return df
 
 
-# --- HEURISTIC APPLIANCE DISAGGREGATION ENGINE ---
 def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFrame:
     df = df.copy()
 
     daily_min = df.groupby("date_only")["estimated_kwh"].transform("min")
     df["app_always_on"] = np.minimum(daily_min, 0.25)
-
     df["active_kwh"] = np.maximum(0.0, df["estimated_kwh"] - df["app_always_on"])
 
     df["app_ev"] = 0.0
@@ -412,11 +355,10 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
                 df.at[idx, "app_laundry"] += laundry_draw
                 active -= laundry_draw
 
-        if active > 0:
-            if 18.0 <= hr < 23.5:
-                ent_draw = active * 0.7
-                df.at[idx, "app_entertainment"] = ent_draw
-                active -= ent_draw
+        if active > 0 and 18.0 <= hr < 23.5:
+            ent_draw = active * 0.7
+            df.at[idx, "app_entertainment"] = ent_draw
+            active -= ent_draw
 
         if active > 0:
             df.at[idx, "app_misc"] = active
@@ -424,11 +366,9 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
     return df
 
 
-# --- STREAMLIT UI LAYOUT ---
 st.title("⚡ Smart Meter Analytics & Cost Dashboard")
-st.markdown("Replicating Electric Ireland's behavioral heuristics, cost forecasting, and smart appliance profiling.")
+st.markdown("Replicating Electric Ireland's behavioural heuristics, cost forecasting, and smart appliance profiling.")
 
-# --- SIDEBAR CONTROLS ---
 st.sidebar.header("📁 Data Source")
 data_option = st.sidebar.radio("Choose Data Input:", ["Upload My Own File", "Use Sample Demo Data"])
 
@@ -440,20 +380,18 @@ if data_option == "Upload My Own File":
         help="Upload standard ESB Smart Meter HDF files or wide daily-pivot files"
     )
 
-# --- TARIFF / COST SIDEBAR ---
 st.sidebar.header("💰 Tariff Settings")
-
 tariff_style = st.sidebar.selectbox(
     "Select Tariff Type:",
-    ["24-Hour Flat Tariff", "Smart (Day/Night/Peak) Tariff"],
+    ["Flat / Same Rate All Day", "Smart Day/Night/Peak"],
     index=0
 )
 
 rates = {}
-if tariff_style == "24-Hour Flat Tariff":
+if tariff_style == "Flat / Same Rate All Day":
     rates["type"] = "flat"
     flat_rate_cent = st.sidebar.number_input(
-        "Flat Rate (Cent / kWh)",
+        "Rate (Cent / kWh)",
         min_value=0.0,
         max_value=200.0,
         value=26.41,
@@ -461,12 +399,14 @@ if tariff_style == "24-Hour Flat Tariff":
         format="%.2f",
     )
     rates["flat_rate"] = flat_rate_cent / 100.0
+    rates["day_rate"] = rates["flat_rate"]
+    rates["night_rate"] = rates["flat_rate"]
+    rates["peak_rate"] = rates["flat_rate"]
 else:
     rates["type"] = "smart"
     day_rate_cent = st.sidebar.number_input("Day Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=28.20, step=0.01, format="%.2f")
     night_rate_cent = st.sidebar.number_input("Night Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=15.10, step=0.01, format="%.2f")
     peak_rate_cent = st.sidebar.number_input("Peak Rate (Cent/kWh)", min_value=0.0, max_value=200.0, value=35.40, step=0.01, format="%.2f")
-
     rates["day_rate"] = day_rate_cent / 100.0
     rates["night_rate"] = night_rate_cent / 100.0
     rates["peak_rate"] = peak_rate_cent / 100.0
@@ -476,21 +416,16 @@ annual_standing = st.sidebar.number_input("Annual Standing Charge (€)", min_va
 annual_pso = st.sidebar.number_input("Annual PSO Levy (€)", min_value=0.0, max_value=200.0, value=19.10, step=0.01)
 vat_rate = st.sidebar.number_input("VAT Rate (%)", min_value=0.0, max_value=100.0, value=9.0, step=0.5) / 100.0
 
-daily_standing_rate = (annual_standing + annual_pso) / 365.25
-rates["daily_standing_charge"] = daily_standing_rate
+rates["daily_standing_charge"] = (annual_standing + annual_pso) / 365.25
 rates["vat_rate"] = vat_rate
 
-# --- APPLIANCE PROFILE SURVEY ---
 st.sidebar.markdown("---")
 st.sidebar.header("🔌 Household Profile Survey")
-st.sidebar.info("Update these settings to shift the disaggregation weights on the Appliance Breakdown tab.")
-
 house_profile = {
     "has_ev": st.sidebar.checkbox("Do you own an Electric Vehicle (EV)?", value=False),
     "electric_heating": st.sidebar.checkbox("Do you use electric space/water heating?", value=True)
 }
 
-# --- LOAD DATA ---
 df_raw = None
 if data_option == "Upload My Own File" and uploaded_file is not None:
     with st.spinner("Processing uploaded smart meter file..."):
@@ -501,7 +436,6 @@ elif data_option == "Use Sample Demo Data":
     df_raw = generate_demo_data()
     st.sidebar.info("💡 Using mock baseline data.")
 
-# --- DISPLAY DASHBOARD ---
 if df_raw is not None and not df_raw.empty:
     df = apply_tariffs(df_raw, rates)
     df["reading_at"] = pd.to_datetime(df["reading_at"])
@@ -528,6 +462,7 @@ if df_raw is not None and not df_raw.empty:
     proj_factor = 1.0
     days_in_month = 30
     days_elapsed = df_filtered["date_only"].nunique()
+    min_projection_days = 7
 
     if selected_month != "All Months":
         try:
@@ -535,7 +470,10 @@ if df_raw is not None and not df_raw.empty:
             days_in_month = calendar.monthrange(y_val, m_val)[1]
             if days_elapsed < days_in_month:
                 is_unfinished = True
-                proj_factor = days_in_month / days_elapsed
+                if days_elapsed >= min_projection_days:
+                    proj_factor = days_in_month / days_elapsed
+                else:
+                    proj_factor = 1.0
         except Exception:
             pass
 
@@ -561,12 +499,20 @@ if df_raw is not None and not df_raw.empty:
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        if is_unfinished:
+        if is_unfinished and proj_factor > 1.0:
             st.markdown(f"""
             <div class="metric-container">
                 <div class="metric-value" style="color: #4e342e;">{projected_kwh:,.1f} kWh</div>
                 <div class="metric-label">Estimated Month-End Usage</div>
                 <div class="metric-badge badge-projected">Actual to-date: {actual_kwh:,.1f} kWh</div>
+            </div>
+            """, unsafe_allow_html=True)
+        elif is_unfinished:
+            st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-value" style="color: #0d47a1;">{actual_kwh:,.1f} kWh</div>
+                <div class="metric-label">Actual Usage To Date</div>
+                <div class="metric-badge badge-warning">Projection disabled until {min_projection_days} days are loaded</div>
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -579,12 +525,20 @@ if df_raw is not None and not df_raw.empty:
             """, unsafe_allow_html=True)
 
     with col2:
-        if is_unfinished:
+        if is_unfinished and proj_factor > 1.0:
             st.markdown(f"""
             <div class="metric-container">
                 <div class="metric-value" style="color: #4e342e;">€{projected_gross_cost:,.2f}</div>
                 <div class="metric-label">Projected Month-End Bill</div>
                 <div class="metric-badge badge-projected">Actual to-date: €{actual_gross_cost:,.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        elif is_unfinished:
+            st.markdown(f"""
+            <div class="metric-container">
+                <div class="metric-value" style="color: #1b5e20;">€{actual_gross_cost:,.2f}</div>
+                <div class="metric-label">Actual Bill To Date</div>
+                <div class="metric-badge badge-warning">Projection disabled until {min_projection_days} days are loaded</div>
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -597,8 +551,8 @@ if df_raw is not None and not df_raw.empty:
             """, unsafe_allow_html=True)
 
     with col3:
-        avg_cost_day = (projected_gross_cost / days_in_month) if is_unfinished else (actual_gross_cost / max(days_elapsed, 1))
-        avg_kwh_day = (projected_kwh / days_in_month) if is_unfinished else (actual_kwh / max(days_elapsed, 1))
+        avg_cost_day = actual_gross_cost / max(days_elapsed, 1)
+        avg_kwh_day = actual_kwh / max(days_elapsed, 1)
         st.markdown(f"""
         <div class="metric-container">
             <div class="metric-value" style="color: #e65100;">€{avg_cost_day:.2f}/day</div>
@@ -661,6 +615,7 @@ if df_raw is not None and not df_raw.empty:
                 markers=True,
                 color_discrete_sequence=["#1e88e5"]
             )
+            fig_mom_kwh.update_xaxes(type="category")
             fig_mom_kwh.update_traces(
                 hovertemplate="<b>Month:</b> %{x}<br><b>Total Usage:</b> %{y:,.1f} kWh<extra></extra>",
                 hoverlabel=dict(bgcolor="#e3f2fd", font_size=16, font_family="monospace")
@@ -678,6 +633,7 @@ if df_raw is not None and not df_raw.empty:
                 color_discrete_map={"Completed": "#2e7d32", "Incomplete (Partial)": "#ef6c00"},
                 text=monthly_summary["total_cost_inc_vat"].map(lambda x: f"€{x:.2f}")
             )
+            fig_mom_cost.update_xaxes(type="category")
             fig_mom_cost.update_traces(
                 hovertemplate="<b>Month:</b> %{x}<br><b>Total Bill:</b> €%{y:.2f}<extra></extra>",
                 hoverlabel=dict(bgcolor="#e8f5e9", font_size=16, font_family="monospace")
@@ -752,6 +708,7 @@ if df_raw is not None and not df_raw.empty:
                         "Projected (Full Month)": "#a1887f"
                     }
                 )
+                fig_bar_kwh.update_xaxes(type="category")
                 st.plotly_chart(fig_bar_kwh, use_container_width=True)
 
             with col_p2:
@@ -767,8 +724,8 @@ if df_raw is not None and not df_raw.empty:
                         "Projected (Full Month)": "#8d6e63"
                     }
                 )
+                fig_bar_cost.update_xaxes(type="category")
                 st.plotly_chart(fig_bar_cost, use_container_width=True)
-
         else:
             st.subheader(f"📅 Granular Daily Breakdowns for {selected_month}")
 
@@ -961,7 +918,6 @@ if df_raw is not None and not df_raw.empty:
         if rates["type"] == "smart" and shift_peak_pct > 0:
             peak_mask = (sim_df["hour"] >= 17) & (sim_df["hour"] < 19)
             shifted = sim_df.loc[peak_mask, "estimated_kwh"] * (shift_peak_pct / 100)
-
             sim_df.loc[peak_mask, "cost"] -= shifted * rates["peak_rate"]
             sim_df.loc[peak_mask, "cost"] += shifted * rates["night_rate"]
 
