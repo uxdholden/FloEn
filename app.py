@@ -517,7 +517,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("📏 Display Units")
 unit_mode = st.sidebar.selectbox(
     "Source/display unit",
-    ["kWh", "Kwt", "kW"],
+    ["kWh (billing)", "Kwt (raw interval chunks)", "kW"],
     index=0,
     help="Choose how interval values are interpreted and displayed."
 )
@@ -547,13 +547,21 @@ if df_raw is not None and not df_raw.empty:
     # 1. Apply costs & extract datetime characteristics
     df = apply_tariffs(df_raw, rates)
     df["reading_at"] = pd.to_datetime(df["reading_at"])
+    df["raw_estimated_kwh"] = df["estimated_kwh"]
+    df["raw_read_value_kw"] = df["read_value_kw"]
 
-    if unit_mode == "Kwt":
-        df["estimated_kwh"] = df["estimated_kwh"] / 2.0
-        df["read_value_kw"] = df["read_value_kw"] / 2.0
+    if unit_mode == "Kwt (raw interval chunks)":
+        df["display_energy"] = df["raw_estimated_kwh"] * 2.0
+        df["display_power"] = df["raw_read_value_kw"] * 2.0
     elif unit_mode == "kW":
-        df["estimated_kwh"] = df["estimated_kwh"] / 2.0
+        df["display_energy"] = df["raw_estimated_kwh"] * 2.0
+        df["display_power"] = df["raw_read_value_kw"]
+    else:
+        df["display_energy"] = df["raw_estimated_kwh"]
+        df["display_power"] = df["raw_read_value_kw"]
 
+    df["estimated_kwh"] = df["display_energy"]
+    df["read_value_kw"] = df["display_power"]
     df["year_month"] = df["reading_at"].dt.strftime("%Y-%m")
     df["day_name"] = df["reading_at"].dt.day_name()
     df["hour_of_day"] = df["reading_at"].dt.hour
