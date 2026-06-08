@@ -122,32 +122,32 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
         if not wide_result.empty:
             return wide_result
 
-        def finalize(df: pd.DataFrame) -> pd.DataFrame:
+    def finalize(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame()
-        
+
         value_col = "read_value" if "read_value" in df.columns else "read_value_kw"
         df = df.dropna(subset=["reading_at", value_col]).copy()
-        
+
         if "read_value_kw" not in df.columns:
             df["read_value_kw"] = pd.to_numeric(df[value_col], errors="coerce")
-            
+
         df["reading_at"] = pd.to_datetime(df["reading_at"], errors="coerce")
         df = df.dropna(subset=["reading_at", "read_value_kw"]).sort_values("reading_at")
-        
+
         if df.empty:
             return pd.DataFrame()
-            
+
         is_kwh = df["read_type"].str.contains("kWh", case=False, na=False) if "read_type" in df.columns else pd.Series([True] * len(df), index=df.index)
         df["interval_hours"] = 0.5
         df["estimated_kwh"] = np.where(is_kwh, df["read_value_kw"], df["read_value_kw"] * df["interval_hours"])
-        
+
         df["date_only"] = df["reading_at"].dt.date
-        
+
         for col in ["mprn", "meter_serial"]:
             if col not in df.columns:
                 df[col] = ""
-                
+
         return df[["mprn", "meter_serial", "reading_at", "read_value_kw", "estimated_kwh", "date_only"]]
 
     # Extract Data using Pandas (CSV Mode)
