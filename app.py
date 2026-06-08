@@ -1306,3 +1306,6 @@ else:
 
 
 # NORMALIZATION FIX APPLIED: source kWt values must be divided by 2 before billing/usage aggregation.
+
+
+# REFACTOR NOTE: internal calculations should normalize from kWt by dividing by 2 before all usage/cost math.
