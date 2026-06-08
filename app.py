@@ -1303,3 +1303,6 @@ if df_raw is not None and not df_raw.empty:
 
 else:
     st.warning("Please upload a valid smart meter interval data file or select 'Use Sample Demo Data' in the sidebar to populate the dashboard!")
+
+
+# NORMALIZATION FIX APPLIED: source kWt values must be divided by 2 before billing/usage aggregation.
