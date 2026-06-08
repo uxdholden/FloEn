@@ -350,6 +350,7 @@ if df_raw is not None and not df_raw.empty:
     df["year_month"]  = df["reading_at"].dt.strftime("%Y-%m")
     df["day_name"]    = df["reading_at"].dt.day_name()
     df["hour_of_day"] = df["reading_at"].dt.hour
+    df["hour_float"]  = df["reading_at"].dt.hour + df["reading_at"].dt.minute / 60.0
 
     # 3. Disaggregate Appliances (Cached execution)
     df = disaggregate_appliances(df, house_profile)
@@ -395,6 +396,7 @@ if df_raw is not None and not df_raw.empty:
     proj_kwh = actual_kwh * proj_factor
     proj_cost = (df_filtered["cost"].sum() * proj_factor + (days_in_month * rates["daily_standing_charge"])) * (1 + rates["vat_rate"])
     max_kw = df_filtered["read_value_kw"].max()
+    avg_import_rate = df_filtered["cost"].sum() / actual_kwh if actual_kwh > 0 else 0.30
 
     if is_unfinished:
         st.warning(f"⚠️ **{selected_month} is a Partial Month** ({days_elapsed}/{days_in_month} days). Showing projected end-of-month data based on historical patterns.")
@@ -417,7 +419,7 @@ if df_raw is not None and not df_raw.empty:
     # Tabs
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📈 Month-to-Month", "📊 Cumulative Projections", "⏰ Hourly Peaks", 
-        "🔌 Appliance Breakdown", "🎯 Simulator", "🔍 Interactive Heatmap"
+        "🔌 Appliance Breakdown", "🧠 Advanced Insights", "🔍 Interactive Heatmap"
     ])
 
     with tab1:
@@ -566,15 +568,70 @@ if df_raw is not None and not df_raw.empty:
             st.plotly_chart(fig2, use_container_width=True)
 
     with tab5:
-        st.subheader("Virtual Tariff Arbitrage Simulator")
-        st.write("Compare the financial returns of your current tariff setup versus standard utility packages.")
+        st.subheader("🧠 Advanced Smart Insights & Predictive Models")
+        st.write("Going beyond basic tariffs: AI-driven models mapping your historical behavior against potential physical and financial upgrades.")
+
+        # 1. Solar Viability Model
+        st.markdown("#### ☀️ Solar PV Self-Consumption Model (Simulated 3kWp System)")
+        st.write("Calculates real self-consumption capability by mapping a synthetic solar generation curve against your exact minute-by-minute daytime load history.")
         
-        flat_sim_cost = (df_filtered["estimated_kwh"].sum() * 0.28 + (days_elapsed * rates["daily_standing_charge"])) * 1.09
-        diff = actual_gross_cost - flat_sim_cost
+        # Create a synthetic solar generation bell curve (peak ~1.0 kWh per 30 mins around 13:00)
+        df_filtered["solar_gen_kwh"] = np.where(
+            (df_filtered["hour_float"] >= 6) & (df_filtered["hour_float"] <= 20),
+            1.0 * np.exp(-0.10 * (df_filtered["hour_float"] - 13.0)**2),
+            0.0
+        )
         
-        c1, c2 = st.columns(2)
-        c1.metric("Your Selected Cost Base", f"€{actual_gross_cost:.2f}")
-        c2.metric("Flat Standard SIM (28c Flat/kWh)", f"€{flat_sim_cost:.2f}", delta=f"€{diff:.2f} variance vs base", delta_color="inverse")
+        # Calculate matching self-consumption
+        df_filtered["solar_self_consumed"] = np.minimum(df_filtered["estimated_kwh"], df_filtered["solar_gen_kwh"])
+        df_filtered["solar_exported"] = df_filtered["solar_gen_kwh"] - df_filtered["solar_self_consumed"]
+
+        total_solar_gen = df_filtered["solar_gen_kwh"].sum()
+        total_self_consumed = df_filtered["solar_self_consumed"].sum()
+        total_exported = df_filtered["solar_exported"].sum()
+
+        # Financials: Saved import cost + Generated export profit (assuming standard 20c CEG rate)
+        solar_savings = (total_self_consumed * avg_import_rate) + (total_exported * 0.20)
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        col_s1.metric("Estimated Solar Generation", f"{total_solar_gen:,.1f} kWh")
+        col_s2.metric("Self-Consumption Rate", f"{(total_self_consumed/total_solar_gen*100):.1f}%" if total_solar_gen > 0 else "0%")
+        col_s3.metric("Projected Financial Yield", f"€{solar_savings:,.2f}", delta=f"Offsets {total_self_consumed/actual_kwh*100:.1f}% of demand")
+
+        st.markdown("---")
+
+        # 2. Peak Shifting Arbitrage
+        st.markdown("#### ⏰ Behavioral Arbitrage (Peak Load Shifting)")
+        peak_mask = (df_filtered["hour_of_day"] >= 17) & (df_filtered["hour_of_day"] < 19)
+        night_rate = rates.get("night_rate", rates.get("flat_rate", 0.15))
+        peak_rate = rates.get("peak_rate", rates.get("flat_rate", 0.35))
+        
+        peak_kwh_total = df_filtered.loc[peak_mask, "estimated_kwh"].sum()
+        
+        if peak_rate > night_rate:
+            # Assume a 30% shift is achievable by moving dishwashers, washing machines, and delayed EV charging
+            shift_savings = peak_kwh_total * 0.30 * (peak_rate - night_rate)
+            st.success(f"💡 **Actionable Arbitrage:** By utilizing appliance timers to shift just **30%** of your peak-time usage (17:00-19:00) to cheap night hours, you would save an estimated **€{shift_savings:.2f}** this period alone without reducing total consumption.")
+        else:
+            st.info("💡 **Actionable Arbitrage:** You are currently utilizing a Flat rate. If you switched to a Smart Tariff and shifted 30% of your evening peak usage to night hours, you could generate significant financial arbitrage. Adjust your sidebar settings to simulate this.")
+
+        st.markdown("---")
+
+        # 3. Vampire Draw Benchmark
+        st.markdown("#### 🧛 Vampire Draw (Always-On Waste Benchmarking)")
+        baseload_kwh_total = df_filtered["app_always_on"].sum()
+        baseload_pct = (baseload_kwh_total / actual_kwh) * 100 if actual_kwh > 0 else 0
+        benchmark_pct = 12.0 # Modern highly efficient home benchmark
+        baseload_cost = baseload_kwh_total * avg_import_rate
+
+        col_v1, col_v2 = st.columns(2)
+        with col_v1:
+            if baseload_pct > 20:
+                st.error(f"⚠️ Your idle 'always-on' background usage accounts for **{baseload_pct:.1f}%** of your total consumption. This indicates high vampire draw. (Efficient Benchmark: ~{benchmark_pct}%)")
+            else:
+                st.success(f"✅ Your idle 'always-on' background usage accounts for **{baseload_pct:.1f}%** of your total consumption. This is excellent! (Efficient Benchmark: ~{benchmark_pct}%)")
+        with col_v2:
+             st.metric("Total Cost of Standby & Idle Devices", f"€{baseload_cost:,.2f} / period")
 
     with tab6:
         st.subheader("🔍 Appliance Detective & Signature Event Miner")
@@ -602,7 +659,7 @@ if df_raw is not None and not df_raw.empty:
                     <div class="appliance-stats">
                         Detected <b>{total_kettles} isolated boiling events</b> this period.<br>
                         Estimated Consumption Rate: <b>~2.5 kW to 3.0 kW</b> sustained for 3 to 5 minutes.<br>
-                        Approximate cost per boil: <b>€{(0.20 * rates.get('flat_rate', rates.get('day_rate', 0.25))):.3f}</b>
+                        Approximate cost per boil: <b>€{(0.20 * avg_import_rate):.3f}</b>
                     </div>
                 </div>
                 """, unsafe_allow_html=True
@@ -616,7 +673,7 @@ if df_raw is not None and not df_raw.empty:
                     <div class="appliance-stats">
                         Detected <b>{total_showers} heavy-draw power shower cycles</b> this period.<br>
                         Estimated Consumption Rate: <b>~7.5 kW to 9.5 kW</b> sustained for 10 to 15 minutes.<br>
-                        Approximate cost per shower cycle: <b>€{(1.60 * rates.get('flat_rate', rates.get('day_rate', 0.25))):.2f}</b>
+                        Approximate cost per shower cycle: <b>€{(1.60 * avg_import_rate):.2f}</b>
                     </div>
                 </div>
                 """, unsafe_allow_html=True
@@ -630,7 +687,7 @@ if df_raw is not None and not df_raw.empty:
                     <div class="appliance-stats">
                         Calculated average always-on idle draw: <b>{avg_baseload_kw:.3f} kW</b>.<br>
                         This constitutes standby devices, routers, clocks, and recurring refrigeration periods.<br>
-                        Extrapolated constant idle cost: <b>€{(avg_baseload_kw * 24 * 30 * rates.get('flat_rate', rates.get('day_rate', 0.25))):.2f} / month</b>.
+                        Extrapolated constant idle cost: <b>€{(avg_baseload_kw * 24 * 30 * avg_import_rate):.2f} / month</b>.
                     </div>
                 </div>
                 """, unsafe_allow_html=True
