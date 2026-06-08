@@ -76,10 +76,10 @@ def parse_wide_csv(raw: str) -> pd.DataFrame:
 
         id_vars = [c for c in [mprn_col, serial_col, date_col] if c]
         melted  = df.melt(id_vars=id_vars, value_vars=time_cols,
-                          var_name="time_slot", value_name="billing_kwh")
+                          var_name="time_slot", value_name="estimated_kwh")
 
-        melted["billing_kwh"] = pd.to_numeric(melted["billing_kwh"], errors="coerce")
-        melted = melted.dropna(subset=["billing_kwh"])
+        melted["estimated_kwh"] = pd.to_numeric(melted["estimated_kwh"], errors="coerce")
+        melted = melted.dropna(subset=["estimated_kwh"])
 
         melted["reading_at"] = pd.to_datetime(
             melted[date_col].astype(str) + " " + melted["time_slot"].str[:5],
@@ -91,10 +91,10 @@ def parse_wide_csv(raw: str) -> pd.DataFrame:
         melted["mprn"]         = melted[mprn_col].astype(str).str.strip()
         melted["meter_serial"] = melted[serial_col].astype(str).str.strip() if serial_col else ""
         # kWh per 30-min slot → average kW = kWh / 0.5
-        melted["read_value_kw"] = melted["billing_kwh"] * 2
+        melted["read_value_kw"] = melted["estimated_kwh"] * 2
         melted["date_only"]     = melted["reading_at"].dt.date
 
-        return melted[["mprn", "meter_serial", "reading_at", "read_value_kw", "billing_kwh", "date_only"]]
+        return melted[["mprn", "meter_serial", "reading_at", "read_value_kw", "estimated_kwh", "date_only"]]
     except Exception:
         return pd.DataFrame()
 
@@ -140,7 +140,7 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
 
         is_kwh = df["read_type"].str.contains("kWh", case=False, na=False) if "read_type" in df.columns else pd.Series([True] * len(df), index=df.index)
         df["interval_hours"] = 0.5
-        df["billing_kwh"] = np.where(is_kwh, df["read_value_kw"], df["read_value_kw"] * df["interval_hours"])
+        df["estimated_kwh"] = np.where(is_kwh, df["read_value_kw"], df["read_value_kw"] * df["interval_hours"])
 
         df["date_only"] = df["reading_at"].dt.date
 
@@ -148,7 +148,7 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
             if col not in df.columns:
                 df[col] = ""
 
-        return df[["mprn", "meter_serial", "reading_at", "read_value_kw", "billing_kwh", "date_only"]]
+        return df[["mprn", "meter_serial", "reading_at", "read_value_kw", "estimated_kwh", "date_only"]]
 
     # Extract Data using Pandas (CSV Mode)
     try:
@@ -301,7 +301,7 @@ def generate_demo_data() -> pd.DataFrame:
             "meter_serial": "000000000024049722",
             "reading_at": dt,
             "read_value_kw": read_val * 2, 
-            "billing_kwh": read_val,
+            "estimated_kwh": read_val,
             "date_only": dt.date()
         })
         
@@ -309,6 +309,22 @@ def generate_demo_data() -> pd.DataFrame:
 
 
 # --- DYNAMIC COST CALCULATION ---
+
+
+def convert_units(value, from_unit, to_unit):
+    if from_unit == to_unit:
+        return value
+    if from_unit == "kWh" and to_unit == "kWt":
+        return value * 2.0
+    if from_unit == "kWt" and to_unit == "kWh":
+        return value / 2.0
+    if from_unit == "kW" and to_unit in ("kWh", "kWt"):
+        return value * 0.5
+    if from_unit in ("kWh", "kWt") and to_unit == "kW":
+        return value * 2.0
+    return value
+
+
 def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
     """
     Applies custom tariff bands to each reading based on the configured rates.
@@ -335,7 +351,7 @@ def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
         }
         df["tariff_rate"] = df["tariff_band"].map(rate_map)
         
-    df["cost"] = df["billing_kwh"] * df["tariff_rate"]
+    df["cost"] = df["estimated_kwh"] * df["tariff_rate"]
     return df
 
 
@@ -344,11 +360,11 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
     df = df.copy()
     
     # Identify daily baseline (Always On/Standby load)
-    daily_min = df.groupby("date_only")["billing_kwh"].transform("min")
+    daily_min = df.groupby("date_only")["estimated_kwh"].transform("min")
     df["app_always_on"] = np.minimum(daily_min, 0.25)
     
     # Remaining active consumption to disaggregate
-    df["active_kwh"] = np.maximum(0.0, df["billing_kwh"] - df["app_always_on"])
+    df["active_kwh"] = np.maximum(0.0, df["estimated_kwh"] - df["app_always_on"])
     
     # Initialize disaggregated categories
     df["app_ev"] = 0.0
@@ -547,35 +563,35 @@ if df_raw is not None and not df_raw.empty:
     # 1. Apply costs & extract datetime characteristics
     df = apply_tariffs(df_raw, rates)
     df["reading_at"] = pd.to_datetime(df["reading_at"])
-    df["display_kwh"] = df["billing_kwh"]
-    df["source_kwh"] = df["billing_kwh"]
-    df["billing_kwh"] = df["billing_kwh"]
+    df["display_kwh"] = df["estimated_kwh"]
+    df["source_kwh"] = df["estimated_kwh"]
+    df["estimated_kwh"] = df["estimated_kwh"]
     if unit_mode == "Kwt":
-        df["source_kwh"] = df["billing_kwh"] / 2.0
+        df["source_kwh"] = df["estimated_kwh"] / 2.0
         df["display_kwh"] = df["source_kwh"]
-        df["billing_kwh"] = df["source_kwh"]
+        df["estimated_kwh"] = df["source_kwh"]
     elif unit_mode == "kW":
-        df["source_kwh"] = df["billing_kwh"] / 2.0
+        df["source_kwh"] = df["estimated_kwh"] / 2.0
         df["display_kwh"] = df["source_kwh"]
-        df["billing_kwh"] = df["source_kwh"]
+        df["estimated_kwh"] = df["source_kwh"]
     else:
-        df["display_kwh"] = df["billing_kwh"]
+        df["display_kwh"] = df["estimated_kwh"]
 
-    df["raw_billing_kwh"] = df["billing_kwh"]
+    df["raw_estimated_kwh"] = df["estimated_kwh"]
     df["raw_read_value_kw"] = df["read_value_kw"]
 
     if unit_mode == "Kwt (raw interval chunks)":
-        df["billing_kwh"] = df["raw_billing_kwh"] * 2.0
+        df["estimated_kwh"] = df["raw_estimated_kwh"] * 2.0
         df["display_power"] = df["raw_read_value_kw"] * 2.0
     elif unit_mode == "kW":
-        df["billing_kwh"] = df["raw_billing_kwh"] * 2.0
+        df["estimated_kwh"] = df["raw_estimated_kwh"] * 2.0
         df["display_power"] = df["raw_read_value_kw"]
     else:
-        df["billing_kwh"] = df["raw_billing_kwh"]
+        df["estimated_kwh"] = df["raw_estimated_kwh"]
         df["display_power"] = df["raw_read_value_kw"]
 
-    df["billing_kwh"] = df["billing_kwh"]
-    df["billing_kwh"] = df["billing_kwh"]
+    df["estimated_kwh"] = df["estimated_kwh"]
+    df["estimated_kwh"] = df["estimated_kwh"]
     df["read_value_kw"] = df["display_power"]
     df["year_month"] = df["reading_at"].dt.strftime("%Y-%m")
     df["day_name"] = df["reading_at"].dt.day_name()
@@ -620,7 +636,7 @@ if df_raw is not None and not df_raw.empty:
             pass
 
     # Aggregate actual figures
-    actual_kwh = df_filtered["billing_kwh"].sum()
+    actual_kwh = df_filtered["estimated_kwh"].sum()
     actual_usage_cost = df_filtered["cost"].sum()
     actual_standing_pso = days_elapsed * rates["daily_standing_charge"]
     actual_gross_cost = (actual_usage_cost + actual_standing_pso) * (1 + rates["vat_rate"])
@@ -736,7 +752,7 @@ if df_raw is not None and not df_raw.empty:
         
         # Monthly aggregates
         monthly_summary = df.groupby("year_month").agg(
-            total_kwh=("billing_kwh", "sum"),
+            total_kwh=("estimated_kwh", "sum"),
             usage_cost=("cost", "sum"),
             days_measured=("date_only", "nunique")
         ).reset_index()
@@ -896,7 +912,7 @@ if df_raw is not None and not df_raw.empty:
             st.subheader(f"📅 Granular Daily Breakdowns for {selected_month}")
             
             daily_summary = df_filtered.groupby("date_only").agg(
-                total_kwh=("billing_kwh", "sum"),
+                total_kwh=("estimated_kwh", "sum"),
                 usage_cost=("cost", "sum")
             ).reset_index()
             daily_summary["total_cost"] = (daily_summary["usage_cost"] + rates["daily_standing_charge"]) * (1 + rates["vat_rate"])
@@ -928,14 +944,14 @@ if df_raw is not None and not df_raw.empty:
         
         # Diurnal usage
         hourly_day_summary = df_filtered.groupby(["hour_of_day"]).agg(
-            avg_kwh=("billing_kwh", "mean")
+            avg_kwh=("estimated_kwh", "mean")
         ).reset_index()
         
         # Weekday vs Weekend Average profile
         df_filtered = df_filtered.copy()
         df_filtered["day_type"] = np.where(df_filtered["reading_at"].dt.dayofweek < 5, "Weekday", "Weekend")
         hourly_daytype_summary = df_filtered.groupby(["hour_of_day", "day_type"]).agg(
-            avg_kwh=("billing_kwh", "mean")
+            avg_kwh=("estimated_kwh", "mean")
         ).reset_index()
         
         col_h1, col_h2 = st.columns(2)
@@ -964,11 +980,11 @@ if df_raw is not None and not df_raw.empty:
                 (df_windows["hour_of_day"] >= 17) & (df_windows["hour_of_day"] < 19)
             ]
             df_windows["time_window"] = np.select(conditions, ["Night (23:00-08:00)", "Peak (17:00-19:00)"], default="Day (08:00-17:00 / 19:00-23:00)")
-            window_summary = df_windows.groupby("time_window")["billing_kwh"].sum().reset_index()
+            window_summary = df_windows.groupby("time_window")["estimated_kwh"].sum().reset_index()
             
             fig_pie_win = px.pie(
                 window_summary,
-                values="billing_kwh",
+                values="estimated_kwh",
                 names="time_window",
                 color="time_window",
                 color_discrete_map={
@@ -1199,30 +1215,30 @@ if df_raw is not None and not df_raw.empty:
         df_detect = df_filtered.copy()
         
         # Shift values to detect adjacent intervals (ensures isolated spikes)
-        df_detect["prev_kwh"] = df_detect["billing_kwh"].shift(1)
-        df_detect["next_kwh"] = df_detect["billing_kwh"].shift(-1)
+        df_detect["prev_kwh"] = df_detect["estimated_kwh"].shift(1)
+        df_detect["next_kwh"] = df_detect["estimated_kwh"].shift(-1)
         
         shower_condition = (
-            (df_detect["billing_kwh"] >= 0.80) & 
+            (df_detect["estimated_kwh"] >= 0.80) & 
             (df_detect["prev_kwh"] < 0.45) & 
             (df_detect["next_kwh"] < 0.45)
         )
         shower_runs = df_detect[shower_condition].copy()
         
         # Apply VAT + standing charge equivalent to each run for financial impact
-        shower_runs["run_cost"] = (shower_runs["billing_kwh"] * rates["flat_rate"] if rates["type"] == "flat" else shower_runs["cost"]) * (1 + rates["vat_rate"])
+        shower_runs["run_cost"] = (shower_runs["estimated_kwh"] * rates["flat_rate"] if rates["type"] == "flat" else shower_runs["cost"]) * (1 + rates["vat_rate"])
         
         # 2. Kettle Run Detection Algorithm
         # Looks for minor spikes between 0.15 kWh and 0.40 kWh above adjacent interval values, occurring during typical daytime hours (07:00 to 22:00)
         df_detect["local_ambient_avg"] = (df_detect["prev_kwh"] + df_detect["next_kwh"]) / 2
-        df_detect["net_spike_above_baseline"] = df_detect["billing_kwh"] - df_detect["local_ambient_avg"]
+        df_detect["net_spike_above_baseline"] = df_detect["estimated_kwh"] - df_detect["local_ambient_avg"]
         
         kettle_condition = (
             (df_detect["net_spike_above_baseline"] >= 0.12) & 
             (df_detect["net_spike_above_baseline"] <= 0.35) & 
             (df_detect["hour_of_day"] >= 7) & 
             (df_detect["hour_of_day"] <= 22) &
-            (df_detect["billing_kwh"] < 0.80) # Ensure we don't double count shower runs
+            (df_detect["estimated_kwh"] < 0.80) # Ensure we don't double count shower runs
         )
         kettle_runs = df_detect[kettle_condition].copy()
         kettle_runs["run_cost"] = (kettle_runs["net_spike_above_baseline"] * rates["flat_rate"] if rates["type"] == "flat" else kettle_runs["cost"]) * (1 + rates["vat_rate"])
@@ -1233,20 +1249,20 @@ if df_raw is not None and not df_raw.empty:
         with res_col1:
             st.markdown(f"#### 🛁 Detected Electric Shower Runs ({len(shower_runs)})")
             if not shower_runs.empty:
-                show_df = shower_runs[["reading_at", "day_name", "billing_kwh", "run_cost"]].copy()
+                show_df = shower_runs[["reading_at", "day_name", "estimated_kwh", "run_cost"]].copy()
                 show_df["Time of Run"] = show_df["reading_at"].dt.strftime("%d %b %Y (%H:%M)")
-                show_df["Consumption"] = show_df["billing_kwh"].map(lambda x: f"{x:.2f} kWh")
+                show_df["Consumption"] = show_df["estimated_kwh"].map(lambda x: f"{x:.2f} kWh")
                 show_df["Cost (Inc. VAT)"] = show_df["run_cost"].map(lambda x: f"€{x:.2f}")
                 
                 # Plotly Interactive Spike Timeline
                 fig_shower = px.scatter(
                     show_df, 
                     x="reading_at", 
-                    y="billing_kwh", 
-                    size="billing_kwh", 
+                    y="estimated_kwh", 
+                    size="estimated_kwh", 
                     color="run_cost",
                     color_continuous_scale="Reds",
-                    labels={"reading_at": "Date & Time", "billing_kwh": "Interval Spike Size (kWh)"}
+                    labels={"reading_at": "Date & Time", "estimated_kwh": "Interval Spike Size (kWh)"}
                 )
                 fig_shower.update_traces(
                     hovertemplate="<b>Shower Run Detected</b><br><b>Time:</b> %{x}<br><b>Energy:</b> %{y:.2f} kWh<extra></extra>",
