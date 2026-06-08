@@ -514,6 +514,15 @@ rates["vat_rate"] = vat_rate
 
 # --- APPLIANCE DISAGGREGATION PROFILE SURVEY ---
 st.sidebar.markdown("---")
+st.sidebar.header("📏 Display Units")
+unit_mode = st.sidebar.selectbox(
+    "Source/display unit",
+    ["kWh", "Kwt", "kW"],
+    index=0,
+    help="Choose how interval values are interpreted and displayed."
+)
+
+st.sidebar.markdown("---")
 st.sidebar.header("🔌 Household Profile Survey")
 st.sidebar.info("Update these settings to shift the disaggregation weights on the 'Appliance Breakdown' tab.")
 
