@@ -107,7 +107,7 @@ def parse_interval_csv(uploaded_file) -> pd.DataFrame:
         
         for idx, line in enumerate(lines):
             line_lower = line.lower()
-            if "mprn" in line_lower && any(k in line_lower for k in ["date", "time", "value"]):
+            if "mprn" in line_lower and any(k in line_lower for k in ["date", "time", "value"]):
                 header_idx = idx
                 break
         
