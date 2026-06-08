@@ -547,6 +547,20 @@ if df_raw is not None and not df_raw.empty:
     # 1. Apply costs & extract datetime characteristics
     df = apply_tariffs(df_raw, rates)
     df["reading_at"] = pd.to_datetime(df["reading_at"])
+    df["display_kwh"] = df["billing_kwh"]
+    df["source_kwh"] = df["billing_kwh"]
+    df["billing_kwh"] = df["billing_kwh"]
+    if unit_mode == "Kwt":
+        df["source_kwh"] = df["billing_kwh"] / 2.0
+        df["display_kwh"] = df["source_kwh"]
+        df["billing_kwh"] = df["source_kwh"]
+    elif unit_mode == "kW":
+        df["source_kwh"] = df["billing_kwh"] / 2.0
+        df["display_kwh"] = df["source_kwh"]
+        df["billing_kwh"] = df["source_kwh"]
+    else:
+        df["display_kwh"] = df["billing_kwh"]
+
     df["raw_billing_kwh"] = df["billing_kwh"]
     df["raw_read_value_kw"] = df["read_value_kw"]
 
