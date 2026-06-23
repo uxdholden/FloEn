@@ -394,6 +394,144 @@ def calculate_smart_projection(df_all: pd.DataFrame, target_month: str, rates: d
 
 
 # ---------------------------------------------------------------------------
+# FULL-MONTH DAY-BY-DAY WEIGHTED TIME SERIES GENERATOR
+# ---------------------------------------------------------------------------
+
+def build_full_month_projection_timeline(df_all: pd.DataFrame, target_month: str, rates: dict):
+    """
+    Constructs a complete daily day-by-day dataframe for target_month (from Day 1 to the end of the month).
+    For missing days in an incomplete month, it applies weighted day-of-week averages (e.g. higher usage on weekends).
+    """
+    y_val, m_val = map(int, target_month.split("-"))
+    days_in_month = calendar.monthrange(y_val, m_val)[1]
+    
+    # Generate every single date in the target month
+    start_date = datetime(y_val, m_val, 1).date()
+    end_date = datetime(y_val, m_val, days_in_month).date()
+    all_dates = [start_date + timedelta(days=x) for x in range(days_in_month)]
+    
+    # Get actual daily data
+    df_month = df_all[df_all["year_month"] == target_month].copy()
+    actuals = {}
+    if not df_month.empty:
+        actuals = df_month.groupby("date_only").agg(
+            kwh=("estimated_kwh", "sum"),
+            cost=("cost", "sum")
+        ).to_dict(orient="index")
+        
+    # Build Day of Week Heuristics from historical data (excluding current month if possible)
+    df_history = df_all[df_all["year_month"] != target_month].copy()
+    if df_history.empty:
+        df_history = df_all.copy() # fallback to using target month itself if there are no other months
+        
+    # Calculate average kwh and cost per day of week (Monday=0, ..., Sunday=6)
+    daily_history = df_history.groupby(["date_only", "day_name", "is_weekend"]).agg(
+        kwh=("estimated_kwh", "sum"),
+        cost=("cost", "sum")
+    ).reset_index()
+    
+    # Group by weekday integer for robust indexing
+    daily_history["weekday_num"] = pd.to_datetime(daily_history["date_only"]).dt.dayofweek
+    dow_averages = daily_history.groupby("weekday_num")[["kwh", "cost"]].mean().to_dict(orient="index")
+    
+    # Fallbacks in case history doesn't cover all days
+    overall_mean_kwh = daily_history["kwh"].mean() if not daily_history.empty else 10.0
+    overall_mean_cost = daily_history["cost"].mean() if not daily_history.empty else 3.0
+    
+    timeline_records = []
+    accumulated_kwh_actual = 0.0
+    accumulated_cost_actual = 0.0
+    accumulated_kwh_projected = 0.0
+    accumulated_cost_projected = 0.0
+    
+    last_actual_date = None
+    if actuals:
+        last_actual_date = max(actuals.keys())
+        
+    for d in all_dates:
+        is_we = (d.weekday() >= 5)
+        day_of_week_num = d.weekday()
+        
+        # Get baseline Day-of-week averages
+        avg_dow_data = dow_averages.get(day_of_week_num, {"kwh": overall_mean_kwh, "cost": overall_mean_cost})
+        proj_kwh_val = avg_dow_data["kwh"]
+        proj_cost_val = avg_dow_data["cost"]
+        
+        is_first_month = (target_month == df_all["year_month"].min())
+        
+        # Determine Status
+        if d in actuals:
+            day_kwh = actuals[d]["kwh"]
+            day_cost = actuals[d]["cost"]
+            status = "Actual"
+            
+            # Update running actual metrics
+            accumulated_kwh_actual += day_kwh
+            accumulated_cost_actual += day_cost
+            
+            # Projective climb tracks actuals directly during actual phase
+            accumulated_kwh_projected = accumulated_kwh_actual
+            accumulated_cost_projected = accumulated_cost_actual
+        else:
+            # If it's the first month starting late, we do NOT project forward or backward
+            if is_first_month:
+                day_kwh = 0.0
+                day_cost = 0.0
+                status = "Unrecorded (Late Start)"
+                
+                accumulated_kwh_projected = accumulated_kwh_actual
+                accumulated_cost_projected = accumulated_cost_actual
+            else:
+                # We project using statistical weights
+                day_kwh = proj_kwh_val
+                day_cost = proj_cost_val
+                status = "Projected"
+                
+                # Projective cumulative climb starts adding from the last actual values
+                accumulated_kwh_projected += day_kwh
+                accumulated_cost_projected += day_cost
+            
+        # Standardize standing charges & VAT on a daily level
+        daily_standing_cost_inc_vat = rates["daily_standing_charge"] * (1 + rates["vat_rate"])
+        gross_actual_cost = (day_cost * (1 + rates["vat_rate"])) + daily_standing_cost_inc_vat if status == "Actual" else 0.0
+        gross_projected_cost = (day_cost * (1 + rates["vat_rate"])) + daily_standing_cost_inc_vat if status in ["Actual", "Projected"] else 0.0
+        
+        gross_accumulated_actual_cost = (accumulated_cost_actual * (1 + rates["vat_rate"])) + (len([x for x in timeline_records if x["Status"] == "Actual"]) + 1) * daily_standing_cost_inc_vat
+        gross_accumulated_projected_cost = (accumulated_cost_projected * (1 + rates["vat_rate"])) + (len(timeline_records) + 1) * daily_standing_cost_inc_vat
+        
+        timeline_records.append({
+            "Date": d,
+            "Day of Month": d.day,
+            "Day Name": d.strftime("%A"),
+            "Is Weekend": is_we,
+            "Status": status,
+            "Daily Consumption (kWh)": day_kwh if status != "Unrecorded (Late Start)" else np.nan,
+            "Daily Projected Trend (kWh)": day_kwh if status in ["Actual", "Projected"] else np.nan,
+            "Daily Cost (€)": gross_actual_cost if status != "Unrecorded (Late Start)" else np.nan,
+            "Daily Projected Cost Trend (€)": gross_projected_cost if status in ["Actual", "Projected"] else np.nan,
+            "Accumulated Consumption Actual (kWh)": accumulated_kwh_actual if status == "Actual" else np.nan,
+            "Accumulated Consumption Projected (kWh)": accumulated_kwh_projected if status in ["Actual", "Projected"] else np.nan,
+            "Accumulated Cost Actual (€)": gross_accumulated_actual_cost if status == "Actual" else np.nan,
+            "Accumulated Cost Projected (€)": gross_accumulated_projected_cost if status in ["Actual", "Projected"] else np.nan
+        })
+        
+    timeline_df = pd.DataFrame(timeline_records)
+    
+    # Handle the seamless line connection: the "Projected" lines should start from the last "Actual" point
+    if last_actual_date and "Projected" in timeline_df["Status"].values:
+        last_act_row = timeline_df[timeline_df["Date"] == last_actual_date].iloc[0]
+        
+        # Find index of the first Projected row (usually right after the last Actual)
+        first_proj_idx = timeline_df[timeline_df["Status"] == "Projected"].index.min()
+        if pd.notna(first_proj_idx):
+            # Connect the Daily Projected curves smoothly
+            timeline_df.loc[timeline_df["Status"] == "Actual", "Daily Projected Trend (kWh)"] = timeline_df["Daily Consumption (kWh)"]
+            timeline_df.loc[timeline_df["Status"] == "Actual", "Daily Projected Cost Trend (€)"] = timeline_df["Daily Cost (€)"]
+
+    return timeline_df
+
+
+# ---------------------------------------------------------------------------
 # STREAMLIT UI
 # ---------------------------------------------------------------------------
 
@@ -569,62 +707,81 @@ if df_raw is not None and not df_raw.empty:
     with tab2:
         st.subheader("Accumulated & Proportional Daily Costs")
         
-        # Cumulative Cost Tracking
-        daily_stats["Cumulative Cost"] = daily_stats["cost_inc_fixed_vat"].cumsum()
-        daily_stats["Day Number"] = np.arange(len(daily_stats)) + 1
+        # Determine target month for rendering full timeline
+        eval_month = selected_month if selected_month != "All Months" else latest_dataset_month
         
-        # Add linear dynamic baseline projections
-        avg_daily = actual_gross_cost / max(days_elapsed, 1)
-        daily_stats["Average Path"] = daily_stats["Day Number"] * avg_daily
-        daily_stats["90th Pct Path"] = daily_stats["Day Number"] * peak_daily_cost
-        daily_stats["10th Pct Path"] = daily_stats["Day Number"] * lowest_daily_cost
+        # Build Day-Type Weighted Timeline Forecast
+        timeline_df = build_full_month_projection_timeline(df, eval_month, rates)
         
         col_side, col_graph = st.columns([1, 3])
         with col_side:
-            st.markdown("#### Cost Range Models")
-            st.write("We modeled your future spend boundaries by evaluating the $90^{\\text{th}}$ and $10^{\\text{th}}$ percentiles of your daily spending history:")
-            st.metric("Worst-Case Projection (90th Pct)", f"€{peak_daily_cost:.2f} / day")
-            st.metric("Best-Case Projection (10th Pct)", f"€{lowest_daily_cost:.2f} / day")
+            st.markdown(f"#### Month Spend Profile: **{eval_month}**")
+            st.write("We model future spending boundaries by analyzing your historical weekday vs weekend averages:")
+            st.metric("Worst-Case Average (90th Pct)", f"€{peak_daily_cost:.2f} / day")
+            st.metric("Best-Case Average (10th Pct)", f"€{lowest_daily_cost:.2f} / day")
             
-            # Interactive Slider to simulate future days
-            sim_days = st.slider("Project Cumulative Costs over Days:", min_value=1, max_value=60, value=30)
+            # Simulated projection slider
+            sim_days = st.slider("Forecast Cumulative Costs over Days:", min_value=1, max_value=60, value=30)
             best_sim_total = lowest_daily_cost * sim_days
             worst_sim_total = peak_daily_cost * sim_days
             st.write(f"In **{sim_days} days**, you are projected to spend between **€{best_sim_total:.2f}** and **€{worst_sim_total:.2f}** based on these percentile rates.")
+            
+            if is_unfinished and selected_month != "All Months":
+                st.info(f"💡 **Forecast Active:** The graphs show actual recorded values up to current days, continuing with statistical day-type weighted averages (including weekend shifts) for the remainder of {eval_month}.")
 
         with col_graph:
+            # 1. DAILY CONSUMPTION TREND (TREND IN DAYS)
+            fig_daily_trend = go.Figure()
+            
+            # Actual Daily Trend Line
+            fig_daily_trend.add_trace(go.Scatter(
+                x=timeline_df["Date"], y=timeline_df["Daily Consumption (kWh)"],
+                mode="lines+markers", name="Actual Daily Consumption (kWh)",
+                line=dict(color="#0d47a1", width=3.5),
+                hovertemplate="<b>Date:</b> %{x}<br><b>Actual Draw:</b> %{y:.2f} kWh<extra></extra>"
+            ))
+            
+            # Projected Daily Trend Line (Seamless dotted transition)
+            fig_daily_trend.add_trace(go.Scatter(
+                x=timeline_df["Date"], y=timeline_df["Daily Projected Trend (kWh)"],
+                mode="lines", name="Projected Daily Trend (Weighted)",
+                line=dict(color="#1565c0", width=2.5, dash="dot"),
+                hovertemplate="<b>Date:</b> %{x}<br><b>Projected Draw:</b> %{y:.2f} kWh<extra></extra>"
+            ))
+            
+            fig_daily_trend.update_layout(
+                title=f"Daily Consumption & Forecast Trend (kWh) - Full Scope of {eval_month}",
+                xaxis_title="Day of Month",
+                yaxis_title="Energy Draw (kWh)",
+                legend_orientation="h"
+            )
+            st.plotly_chart(fig_daily_trend, use_container_width=True)
+            
+            st.markdown("---")
+            
+            # 2. ACCUMULATED CLIMB (PROJECTIVE CLIMB)
             fig_cum = go.Figure()
-            # Plot actual cumulative spend
+            
+            # Actual Cumulative Cost
             fig_cum.add_trace(go.Scatter(
-                x=daily_stats["date_only"], y=daily_stats["Cumulative Cost"],
-                mode='lines+markers', name='Actual Accumulated Spend',
-                line=dict(color='#1b5e20', width=4),
-                hovertemplate="<b>Date:</b> %{x}<br><b>Accumulated Cost:</b> €%{y:,.2f}<extra></extra>"
+                x=timeline_df["Date"], y=timeline_df["Accumulated Cost Actual (€)"],
+                mode="lines+markers", name="Actual Cumulative Spend (€)",
+                line=dict(color="#1b5e20", width=4),
+                hovertemplate="<b>Date:</b> %{x}<br><b>Actual Cumulative spend:</b> €%{y:,.2f}<extra></extra>"
             ))
-            # Plot typical average path
+            
+            # Projected Cumulative Cost (Dotted Transition)
             fig_cum.add_trace(go.Scatter(
-                x=daily_stats["date_only"], y=daily_stats["Average Path"],
-                mode='lines', name='Linear Average Base Path',
-                line=dict(color='#1e88e5', dash='dash'),
-                hovertemplate="<b>Date:</b> %{x}<br><b>Linear Average Base:</b> €%{y:,.2f}<extra></extra>"
-            ))
-            # Bound shading for confidence interval (90th vs 10th percentile daily bounds)
-            fig_cum.add_trace(go.Scatter(
-                x=daily_stats["date_only"], y=daily_stats["90th Pct Path"],
-                mode='lines', name='Upper Peak Projection (90th %)',
-                line=dict(color='#ef5350', width=1, dash='dot')
-            ))
-            fig_cum.add_trace(go.Scatter(
-                x=daily_stats["date_only"], y=daily_stats["10th Pct Path"],
-                mode='lines', name='Lower Savings Projection (10th %)',
-                line=dict(color='#66bb6a', width=1, dash='dot'),
-                fill='tonexty', fillcolor='rgba(139, 195, 74, 0.1)'
+                x=timeline_df["Date"], y=timeline_df["Accumulated Cost Projected (€)"],
+                mode="lines", name="Projected Spend Climb (€)",
+                line=dict(color="#43a047", width=3, dash="dot"),
+                hovertemplate="<b>Date:</b> %{x}<br><b>Projected Cumulative Spend:</b> €%{y:,.2f}<extra></extra>"
             ))
             
             fig_cum.update_layout(
-                title="Accumulated Billing Growth vs Dynamic Percentile Boundaries",
-                xaxis_title="Date",
-                yaxis_title="Total Cost Accumulation (Inc. Standing Charges & VAT)",
+                title=f"Projective Cumulative Spend Climb (Inc. Standing Charges & VAT) - {eval_month}",
+                xaxis_title="Day of Month",
+                yaxis_title="Total Bill Accumulation (€)",
                 legend_orientation="h"
             )
             st.plotly_chart(fig_cum, use_container_width=True)
