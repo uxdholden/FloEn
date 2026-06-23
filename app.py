@@ -169,8 +169,14 @@ def parse_interval_csv(raw_bytes: bytes) -> pd.DataFrame:
 @st.cache_data
 def generate_demo_data() -> pd.DataFrame:
     np.random.seed(42)
+    # Generate exactly 90 days ending today, starting on day 12 of the first month to simulate a "late start" month
     end_date   = datetime.now().replace(minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=90)
+    
+    # Adjust start date to middle of month to guarantee a realistic late-start test case
+    if start_date.day < 10:
+        start_date = start_date.replace(day=15)
+        
     date_range = pd.date_range(start=start_date, end=end_date, freq="30min")
 
     rows = []
@@ -287,6 +293,106 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
     
     return df
 
+
+# ---------------------------------------------------------------------------
+# DYNAMIC BOUNDARY PROJECTION ENGINE
+# ---------------------------------------------------------------------------
+
+def calculate_smart_projection(df_all: pd.DataFrame, target_month: str, rates: dict):
+    """
+    Computes weighted projections for a specific target month.
+    - If target_month is the latest in progress, it scales up to the full month using historical day-type averages.
+    - If target_month is the first month and starts late, it keeps the projection as actuals (no retrospective scaling).
+    """
+    df_month = df_all[df_all["year_month"] == target_month].copy()
+    if df_month.empty:
+        return 0.0, 0.0, 0.0, 0.0, False, 1, 30
+    
+    actual_kwh = df_month["estimated_kwh"].sum()
+    actual_usage_cost = df_month["cost"].sum()
+    
+    # Calculate days recorded in this month
+    days_recorded = sorted(df_month["date_only"].unique())
+    days_elapsed = len(days_recorded)
+    
+    # Get total days in this calendar month
+    y_val, m_val = map(int, target_month.split("-"))
+    days_in_month = calendar.monthrange(y_val, m_val)[1]
+    
+    is_latest_month = (target_month == df_all["year_month"].max())
+    is_first_month = (target_month == df_all["year_month"].min())
+    
+    is_unfinished = False
+    projected_kwh = actual_kwh
+    projected_usage_cost = actual_usage_cost
+    
+    # Scenario A: The latest month is currently in progress (unfinished)
+    if is_latest_month and (days_elapsed < days_in_month):
+        is_unfinished = True
+        
+        last_recorded_date = max(days_recorded)
+        
+        # Map remaining calendar dates
+        remaining_dates = []
+        curr = last_recorded_date + timedelta(days=1)
+        end_of_month_date = datetime(y_val, m_val, days_in_month).date()
+        while curr <= end_of_month_date:
+            remaining_dates.append(curr)
+            curr += timedelta(days=1)
+            
+        if remaining_dates:
+            # Gather clean daily profiles from historical data (excluding target month) if available
+            df_history = df_all[df_all["year_month"] != target_month].copy()
+            if df_history.empty:
+                df_history = df_month.copy()
+            
+            daily_history = df_history.groupby(["date_only", "is_weekend"])["estimated_kwh"].sum().reset_index()
+            
+            # Weekend/Weekday consumption split
+            weekday_avg = daily_history[~daily_history["is_weekend"]]["estimated_kwh"].mean()
+            weekend_avg = daily_history[daily_history["is_weekend"]]["estimated_kwh"].mean()
+            
+            overall_mean = daily_history["estimated_kwh"].mean() if not daily_history.empty else 10.0
+            if pd.isna(weekday_avg): weekday_avg = overall_mean
+            if pd.isna(weekend_avg): weekend_avg = overall_mean
+            
+            # Track average tariff rate paid
+            df_history["rate_paid"] = df_history["cost"] / df_history["estimated_kwh"].replace(0, np.nan)
+            avg_rate = df_history["rate_paid"].mean()
+            if pd.isna(avg_rate):
+                avg_rate = rates.get("flat_rate", rates.get("day_rate", 0.28))
+                
+            proj_rem_kwh = 0.0
+            proj_rem_cost = 0.0
+            for r_date in remaining_dates:
+                is_we = (r_date.weekday() >= 5)
+                day_kwh = weekend_avg if is_we else weekday_avg
+                proj_rem_kwh += day_kwh
+                proj_rem_cost += day_kwh * avg_rate
+                
+            projected_kwh = actual_kwh + proj_rem_kwh
+            projected_usage_cost = actual_usage_cost + proj_rem_cost
+            
+    # Scenario B: The first month starts late
+    # Keep projection equal to actuals for the active part of that historical month
+    elif is_first_month:
+        projected_kwh = actual_kwh
+        projected_usage_cost = actual_usage_cost
+        
+    # Standardize standing charges & VAT
+    actual_standing_pso = days_elapsed * rates["daily_standing_charge"]
+    actual_gross_cost = (actual_usage_cost + actual_standing_pso) * (1 + rates["vat_rate"])
+    
+    if is_unfinished:
+        projected_standing_pso = days_in_month * rates["daily_standing_charge"]
+    else:
+        projected_standing_pso = days_elapsed * rates["daily_standing_charge"]
+        
+    projected_gross_cost = (projected_usage_cost + projected_standing_pso) * (1 + rates["vat_rate"])
+    
+    return actual_kwh, actual_gross_cost, projected_kwh, projected_gross_cost, is_unfinished, days_elapsed, days_in_month
+
+
 # ---------------------------------------------------------------------------
 # STREAMLIT UI
 # ---------------------------------------------------------------------------
@@ -351,6 +457,7 @@ if df_raw is not None and not df_raw.empty:
     df["day_name"]    = df["reading_at"].dt.day_name()
     df["hour_of_day"] = df["reading_at"].dt.hour
     df["hour_float"]  = df["reading_at"].dt.hour + df["reading_at"].dt.minute / 60.0
+    df["is_weekend"]  = df["reading_at"].dt.dayofweek >= 5
 
     # 3. Disaggregate Appliances (Cached execution)
     df = disaggregate_appliances(df, house_profile)
@@ -361,29 +468,43 @@ if df_raw is not None and not df_raw.empty:
     months = sorted(df["year_month"].unique().tolist())
     selected_month = st.sidebar.selectbox("Select Period:", ["All Months"] + months)
     
+    # Get overall active list of months to analyze bounds
+    first_dataset_month = df["year_month"].min()
+    latest_dataset_month = df["year_month"].max()
+
+    # 4. RUN COMPREHENSIVE PROJECTION METRICS
+    if selected_month == "All Months":
+        # Sum up individual smart projections for each month to respect boundaries
+        actual_kwh = 0.0
+        actual_gross_cost = 0.0
+        proj_kwh = 0.0
+        proj_cost = 0.0
+        is_unfinished = False
+        days_elapsed = 0
+        days_in_month = 0
+        
+        for m in months:
+            m_act_kwh, m_act_cost, m_proj_kwh, m_proj_cost, m_unf, m_el, m_tot = calculate_smart_projection(df, m, rates)
+            actual_kwh += m_act_kwh
+            actual_gross_cost += m_act_cost
+            proj_kwh += m_proj_kwh
+            proj_cost += m_proj_cost
+            days_elapsed += m_el
+            days_in_month += m_tot
+            if m_unf:
+                is_unfinished = True
+    else:
+        actual_kwh, actual_gross_cost, proj_kwh, proj_cost, is_unfinished, days_elapsed, days_in_month = calculate_smart_projection(df, selected_month, rates)
+
     df_filtered = df[df["year_month"] == selected_month].copy() if selected_month != "All Months" else df.copy()
 
-    # Metrics & Statistical Percentile Projections
-    days_elapsed = df_filtered["date_only"].nunique()
-    days_in_month = 30
-    is_unfinished, proj_factor = False, 1.0
-
-    if selected_month != "All Months":
-        y_val, m_val = map(int, selected_month.split("-"))
-        days_in_month = calendar.monthrange(y_val, m_val)[1]
-        if days_elapsed < days_in_month:
-            is_unfinished = True
-            proj_factor = (days_in_month / days_elapsed) if days_elapsed >= 7 else 1.0
-
-    # Calculate Historical Daily Values for Percentiles
+    # Calculate metrics & daily patterns
     daily_stats = df_filtered.groupby("date_only").agg(
         kwh=("estimated_kwh", "sum"),
         cost=("cost", "sum")
     ).reset_index()
-    
     daily_stats["cost_inc_fixed_vat"] = (daily_stats["cost"] + rates["daily_standing_charge"]) * (1 + rates["vat_rate"])
 
-    # Best-case (10th percentile) and Worst-case (90th percentile) daily rates
     if not daily_stats.empty:
         lowest_daily_cost = daily_stats["cost_inc_fixed_vat"].quantile(0.10)
         peak_daily_cost   = daily_stats["cost_inc_fixed_vat"].quantile(0.90)
@@ -391,23 +512,26 @@ if df_raw is not None and not df_raw.empty:
         lowest_daily_cost = 0.0
         peak_daily_cost   = 0.0
 
-    actual_kwh = df_filtered["estimated_kwh"].sum()
-    actual_gross_cost = (df_filtered["cost"].sum() + (days_elapsed * rates["daily_standing_charge"])) * (1 + rates["vat_rate"])
-    proj_kwh = actual_kwh * proj_factor
-    proj_cost = (df_filtered["cost"].sum() * proj_factor + (days_in_month * rates["daily_standing_charge"])) * (1 + rates["vat_rate"])
     max_kw = df_filtered["read_value_kw"].max()
     avg_import_rate = df_filtered["cost"].sum() / actual_kwh if actual_kwh > 0 else 0.30
 
+    # Display Warning Cards
     if is_unfinished:
-        st.warning(f"⚠️ **{selected_month} is a Partial Month** ({days_elapsed}/{days_in_month} days). Showing projected end-of-month data based on historical patterns.")
+        st.warning(f"⚠️ **Target Period is Incomplete.** Only **{days_elapsed} of {days_in_month} days** are recorded. Projections for the active month are highlighted in brown.")
+    
+    if selected_month == first_dataset_month and first_dataset_month != latest_dataset_month:
+        # Check if first day starts late in the month (e.g. > 1st)
+        first_recorded_day = df[df["year_month"] == first_dataset_month]["reading_at"].min().day
+        if first_recorded_day > 1:
+            st.info(f"ℹ️ **First recorded month starts late on Day {first_recorded_day}.** Projections are kept equivalent to actuals based on the remaining active days, preventing retrospective inflation.")
 
-    # Top KPI Cards with Upgraded Insights
+    # Top KPI Cards
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        color, val, label, sub = ("#4e342e", proj_kwh, "Estimated Month-End", f"Actual: {actual_kwh:,.1f} kWh") if (is_unfinished and proj_factor > 1) else ("#0d47a1", actual_kwh, "Total Consumption", "Completed Period")
+        color, val, label, sub = ("#4e342e", proj_kwh, "Estimated Period-End", f"Actual to-date: {actual_kwh:,.1f} kWh") if is_unfinished else ("#0d47a1", actual_kwh, "Total Consumption", "Completed Period")
         st.markdown(f'<div class="metric-container"><div class="metric-value" style="color:{color};">{val:,.1f} kWh</div><div class="metric-label">{label}</div><div class="metric-badge badge-actual">{sub}</div></div>', unsafe_allow_html=True)
     with col2:
-        color, val, label, sub = ("#4e342e", proj_cost, "Projected Monthly Bill", f"Actual to-date: €{actual_gross_cost:,.2f}") if (is_unfinished and proj_factor > 1) else ("#1b5e20", actual_gross_cost, "Total Cost (Inc VAT)", "Completed Period")
+        color, val, label, sub = ("#4e342e", proj_cost, "Projected Period Bill", f"Actual to-date: €{actual_gross_cost:,.2f}") if is_unfinished else ("#1b5e20", actual_gross_cost, "Total Cost (Inc VAT)", "Completed Period")
         st.markdown(f'<div class="metric-container"><div class="metric-value" style="color:{color};">€{val:,.2f}</div><div class="metric-label">{label}</div><div class="metric-badge badge-success">{sub}</div></div>', unsafe_allow_html=True)
     with col3:
         st.markdown(f'<div class="metric-container"><div class="metric-value" style="color:#e65100;">€{(actual_gross_cost/max(days_elapsed,1)):.2f}/day</div><div class="metric-label">Avg Daily Cost</div><div class="metric-badge badge-warning">Target: < €{(actual_gross_cost*0.9/max(days_elapsed,1)):.2f}</div></div>', unsafe_allow_html=True)
