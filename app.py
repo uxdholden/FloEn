@@ -66,6 +66,7 @@ CUSTOM_CSS = """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
+# PARSING HELPERS (Cached for performance)
 # ---------------------------------------------------------------------------
 
 def _kwt_to_kwh(series: pd.Series) -> pd.Series:
@@ -164,7 +165,7 @@ def parse_interval_csv(raw_bytes: bytes) -> pd.DataFrame:
 
     # Regex fallback
     pattern = re.compile(
-        r"(?P<mprn>\d{11})[,\s\t;]+(?P<serial>[A-Za-z0-9_-]+)[,\s\t;]+(?P<value>\d+(?:\.\d+)?)[,\s\t;]+"
+        r"(?P<mprn>\d{11})[,\s\t;]+(?P<serial>[A-Za-0-9_-]+)[,\s\t;]+(?P<value>\d+(?:\.\d+)?)[,\s\t;]+"
         r"(?P<read_type>Active Import Interval.*?)[,\s\t;]+(?P<date>\d{2}[-/]\d{2}[-/]\d{4})[,\s\t ]+(?P<time>\d{2}:?\d{2})"
     )
     
@@ -176,9 +177,6 @@ def parse_interval_csv(raw_bytes: bytes) -> pd.DataFrame:
 
     return finalize(pd.DataFrame(rows)) if rows else pd.DataFrame()
 
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 
 @st.cache_data
 def generate_demo_data() -> pd.DataFrame:
@@ -221,6 +219,7 @@ def generate_demo_data() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ---------------------------------------------------------------------------
+# VECTORIZED PROCESSORS (Cached & Fast)
 # ---------------------------------------------------------------------------
 
 def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
@@ -236,6 +235,7 @@ def apply_tariffs(df: pd.DataFrame, rates: dict) -> pd.DataFrame:
     
     df["cost"] = df["estimated_kwh"] * df["tariff_rate"]
     return df
+
 
 @st.cache_data
 def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFrame:
@@ -308,6 +308,7 @@ def disaggregate_appliances(df: pd.DataFrame, house_profile: dict) -> pd.DataFra
 
 
 # ---------------------------------------------------------------------------
+# DYNAMIC BOUNDARY PROJECTION ENGINE
 # ---------------------------------------------------------------------------
 
 def calculate_smart_projection(df_all: pd.DataFrame, target_month: str, rates: dict):
@@ -396,6 +397,11 @@ def calculate_smart_projection(df_all: pd.DataFrame, target_month: str, rates: d
 # ---------------------------------------------------------------------------
 
 def build_full_month_projection_timeline(df_all: pd.DataFrame, target_month: str, rates: dict):
+    """
+    Constructs an extended daily day-by-day dataframe:
+    - Target Month: (Day 1 to End of Month) with actuals + day-of-week weighted projections.
+    - Next Month: Appends the entire subsequent month fully projected, resetting accumulation metrics to 0 on Day 1.
+    """
     y_val, m_val = map(int, target_month.split("-"))
     days_in_month = calendar.monthrange(y_val, m_val)[1]
     
@@ -407,7 +413,6 @@ def build_full_month_projection_timeline(df_all: pd.DataFrame, target_month: str
     next_y_val = y_val if m_val < 12 else y_val + 1
     next_days_in_month = calendar.monthrange(next_y_val, next_m_val)[1]
     next_start_date = datetime(next_y_val, next_m_val, 1).date()
-    next_end_date = datetime(next_y_val, next_m_val, next_days_in_month).date()
     next_dates = [next_start_date + timedelta(days=x) for x in range(next_days_in_month)]
     
     all_dates = target_dates + next_dates
@@ -436,6 +441,8 @@ def build_full_month_projection_timeline(df_all: pd.DataFrame, target_month: str
     overall_mean_cost = daily_history["cost"].mean() if not daily_history.empty else 3.0
     
     timeline_records = []
+    
+    # Trackers for the active accumulation month
     accumulated_kwh_actual = 0.0
     accumulated_cost_actual = 0.0
     accumulated_kwh_projected = 0.0
@@ -445,9 +452,23 @@ def build_full_month_projection_timeline(df_all: pd.DataFrame, target_month: str
     if actuals:
         last_actual_date = max(actuals.keys())
         
+    current_iter_month = None
+    days_in_current_accum_month = 0
+    
     for d in all_dates:
         is_we = (d.weekday() >= 5)
         day_of_week_num = d.weekday()
+        
+        # RESET CUMULATIVES ON MONTH BOUNDARY crossing (For next month start at 0 again)
+        if current_iter_month is not None and d.month != current_iter_month:
+            accumulated_kwh_actual = 0.0
+            accumulated_cost_actual = 0.0
+            accumulated_kwh_projected = 0.0
+            accumulated_cost_projected = 0.0
+            days_in_current_accum_month = 0
+            
+        current_iter_month = d.month
+        days_in_current_accum_month += 1
         
         avg_dow_data = dow_averages.get(day_of_week_num, {"kwh": overall_mean_kwh, "cost": overall_mean_cost})
         proj_kwh_val = avg_dow_data["kwh"]
@@ -486,8 +507,8 @@ def build_full_month_projection_timeline(df_all: pd.DataFrame, target_month: str
         gross_actual_cost = (day_cost * (1 + rates["vat_rate"])) + daily_standing_cost_inc_vat if status == "Actual" else 0.0
         gross_projected_cost = (day_cost * (1 + rates["vat_rate"])) + daily_standing_cost_inc_vat if status in ["Actual", "Projected (Target Month)", "Projected (Next Month)"] else 0.0
         
-        gross_accumulated_actual_cost = (accumulated_cost_actual * (1 + rates["vat_rate"])) + (len([x for x in timeline_records if x["Status"] == "Actual"]) + 1) * daily_standing_cost_inc_vat
-        gross_accumulated_projected_cost = (accumulated_cost_projected * (1 + rates["vat_rate"])) + (len(timeline_records) + 1) * daily_standing_cost_inc_vat
+        gross_accumulated_actual_cost = (accumulated_cost_actual * (1 + rates["vat_rate"])) + (days_in_current_accum_month) * daily_standing_cost_inc_vat if status == "Actual" else np.nan
+        gross_accumulated_projected_cost = (accumulated_cost_projected * (1 + rates["vat_rate"])) + (days_in_current_accum_month) * daily_standing_cost_inc_vat
         
         timeline_records.append({
             "Date": d,
@@ -519,9 +540,7 @@ def build_full_month_projection_timeline(df_all: pd.DataFrame, target_month: str
 # STREAMLIT UI SETUP & DATA IMPORT
 # ---------------------------------------------------------------------------
 
-st.markdown("<p style='font-size: 1.2rem; color: #555;'>Analyze your electricity usage, simulate hyper-actionable savings plans, and model battery/appliance payback periods.</p>", unsafe_allow_html=True)
-
-# ── Sidebar ──
+st.sidebar.markdown("---")
 with st.sidebar:
     st.header("📁 Data Source")
     data_option  = st.radio("Choose Data Input:", ["Upload My Own File", "Use Sample Demo Data"])
@@ -554,7 +573,6 @@ with st.sidebar:
         "electric_heating": st.checkbox("Use electric space/water heating?", value=True)
     }
 
-# ── Load Data ──
 df_raw = None
 if data_option == "Upload My Own File" and uploaded_file is not None:
     with st.spinner("Processing smart meter file..."):
@@ -628,6 +646,8 @@ if df_raw is not None and not df_raw.empty:
     max_kw = df_filtered["read_value_kw"].max()
     avg_import_rate = df_filtered["cost"].sum() / actual_kwh if actual_kwh > 0 else 0.30
 
+    st.markdown("<p style='font-size: 1.2rem; color: #555;'>Analyze your electricity usage, simulate hyper-actionable savings plans, and model battery/appliance payback periods.</p>", unsafe_allow_html=True)
+
     if is_unfinished:
         st.warning(f"⚠️ **Target Period is Incomplete.** Only **{days_elapsed} of {days_in_month} days** are recorded. Projections for the active month are highlighted in brown.")
     
@@ -650,7 +670,6 @@ if df_raw is not None and not df_raw.empty:
 
     st.markdown("---")
 
-    # Dynamic Actionable Tabs Setup
     tab_list = [
         "📈 Historical Trends", 
         "📊 Monthly Forecasts", 
@@ -665,6 +684,7 @@ if df_raw is not None and not df_raw.empty:
     tabs = st.tabs(tab_list)
 
     # ---------------------------------------------------------------------------
+    # TAB 1: HISTORICAL TRENDS
     # ---------------------------------------------------------------------------
     with tabs[0]:
         st.subheader("Monthly Historical Trends")
@@ -687,6 +707,7 @@ if df_raw is not None and not df_raw.empty:
             st.plotly_chart(fig2, use_container_width=True)
 
     # ---------------------------------------------------------------------------
+    # TAB 2: MONTHLY FORECASTS & CURRENT OUTLOOK
     # ---------------------------------------------------------------------------
     with tabs[1]:
         st.subheader("Accumulated & Proportional Daily Costs with Month-Ahead Forecasting")
@@ -705,6 +726,17 @@ if df_raw is not None and not df_raw.empty:
         else:
             total_next_month_cost = 0.0
 
+        # Calculate exact spend from NOW until end of month (Target Month Projected Dates)
+        remaining_target_df = timeline_df[timeline_df["Status"] == "Projected (Target Month)"].copy()
+        remaining_days = len(remaining_target_df)
+        
+        total_remaining_kwh = remaining_target_df["Daily Projected Trend (kWh)"].sum()
+        total_remaining_cost = remaining_target_df["Daily Projected Cost Trend (€)"].sum()
+        
+        # Build consecutive indexing for cumulative remaining calculations
+        remaining_target_df["Cumulative Remaining kWh"] = remaining_target_df["Daily Projected Trend (kWh)"].cumsum()
+        remaining_target_df["Cumulative Remaining Cost (€)"] = remaining_target_df["Daily Projected Cost Trend (€)"].cumsum()
+
         col_side, col_graph = st.columns([1, 3])
         with col_side:
             st.markdown(f"#### Spend Profile: **{eval_month}**")
@@ -714,7 +746,7 @@ if df_raw is not None and not df_raw.empty:
             
             st.markdown("---")
             st.markdown(f"#### 📅 Forecast: **{next_month_name}**")
-            st.write("Day-type weighted projection for the next calendar month:")
+            st.write("Day-type weighted projection for the next calendar month (resets to zero at Day 1):")
             st.metric(f"Projected {next_month_name} Usage", f"{total_next_month_kwh:,.1f} kWh")
             st.metric(f"Forecasted {next_month_name} Bill", f"€{total_next_month_cost:,.2f}")
             
@@ -725,6 +757,7 @@ if df_raw is not None and not df_raw.empty:
             st.write(f"In **{sim_days} days**, you are projected to spend between **€{best_sim_total:.2f}** and **€{worst_sim_total:.2f}**.")
 
         with col_graph:
+            # 1. DAILY CONSUMPTION TREND (TREND IN DAYS)
             fig_daily_trend = go.Figure()
             fig_daily_trend.add_trace(go.Scatter(
                 x=timeline_df["Date"], y=timeline_df["Daily Consumption (kWh)"],
@@ -754,6 +787,7 @@ if df_raw is not None and not df_raw.empty:
             
             st.markdown("---")
             
+            # 2. ACCUMULATED CLIMB (PROJECTIVE CLIMB) - Resets on month boundary crossing
             fig_cum = go.Figure()
             fig_cum.add_trace(go.Scatter(
                 x=timeline_df["Date"], y=timeline_df["Accumulated Cost Actual (€)"],
@@ -774,20 +808,59 @@ if df_raw is not None and not df_raw.empty:
                 fig_cum.add_vline(x=sep_date, line_width=1.5, line_dash="dash", line_color="#b0bec5")
 
             fig_cum.update_layout(
-                title=f"Projective Cumulative Spend Climb (Inc. Standing Charges & VAT) - Through {next_month_name}",
+                title=f"Projective Cumulative Spend Climb (Inc. Standing Charges & VAT) - Resets at 1st of {next_month_name}",
                 xaxis_title="Date",
                 yaxis_title="Total Bill Accumulation (€)",
                 legend_orientation="h"
             )
             st.plotly_chart(fig_cum, use_container_width=True)
 
+        # ------------------- OUTLOOK DETAILED PANEL: Now to End of Month -------------------
+        st.markdown("---")
+        st.subheader("🔮 Outlook: Remaining Spend Details (Now until End of Month)")
+        
+        if remaining_days > 0:
+            st.markdown(f"This is your isolated spending trajectory for the remaining **{remaining_days} days** of **{eval_month}**.")
+            
+            oc1, oc2, oc3 = st.columns(3)
+            with oc1:
+                st.metric("Total Remaining Days", f"{remaining_days} Days", delta="To-date actuals complete")
+            with oc2:
+                st.metric("Projected Spend (Now to End of Month)", f"€{total_remaining_cost:.2f}", delta=f"~ {total_remaining_kwh:.1f} kWh total")
+            with oc3:
+                st.metric("Estimated Daily Remaining Spend", f"€{(total_remaining_cost/remaining_days):.2f} / day", delta="Daily average baseline")
+                
+            # Render descriptive dataframe of "Now to End of Month" daily and cumulative details
+            display_rem_df = remaining_target_df[[
+                "Date", "Day Name", "Daily Projected Trend (kWh)", "Daily Projected Cost Trend (€)", 
+                "Cumulative Remaining kWh", "Cumulative Remaining Cost (€)"
+            ]].copy()
+            
+            display_rem_df.columns = [
+                "Date", "Day Name", "Projected Daily Usage (kWh)", "Projected Daily Cost (Inc VAT + Standing) (€)", 
+                "Cumulative Outlook (kWh)", "Cumulative Outlook (€)"
+            ]
+            
+            st.dataframe(
+                display_rem_df.style.format({
+                    "Projected Daily Usage (kWh)": "{:.2f}",
+                    "Projected Daily Cost (Inc VAT + Standing) (€)": "€{:.2f}",
+                    "Cumulative Outlook (kWh)": "{:.2f}",
+                    "Cumulative Outlook (€)": "€{:.2f}"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("The selected month is fully recorded and completed. Select an active/incomplete month from the filter to view the live 'Now to End of Month' daily projections.")
+
     # ---------------------------------------------------------------------------
+    # TAB 3: TARIFF AUTOPILOT & ARBITRAGE
     # ---------------------------------------------------------------------------
     with tabs[2]:
         st.subheader("⚡ Tariff Autopilot & Load Shifting Simulator")
         st.write("Other utility companies simply show you static costs. Our **Tariff Autopilot** allows you to simulate changing behavioral patterns directly on your historical data.")
         
-        # Load Shifting Inputs
         st.markdown("### 🔄 Load Shifting Controls")
         col_ctrl1, col_ctrl2 = st.columns(2)
         
@@ -843,6 +916,7 @@ if df_raw is not None and not df_raw.empty:
         st.plotly_chart(fig_shift, use_container_width=True)
 
     # ---------------------------------------------------------------------------
+    # TAB 4: HEATING & THERMOSTAT ROI ENGINE
     # ---------------------------------------------------------------------------
     with tabs[3]:
         st.subheader("🌡️ Thermostat Auditing & Heat Pump ROI Engine")
@@ -871,7 +945,6 @@ if df_raw is not None and not df_raw.empty:
         
         hp_install_cost = st.number_input("Est. Net Installation Cost (After Subsidies/Grants) (€):", value=6500.0)
         
-        # Upgrade math: resistive kwh -> heat pump kwh = original_kwh / 3.5
         hp_annual_kwh_saved = (total_heating_kwh * (selected_month == "All Months" and 1 or 12)) * (1 - (1.0 / 3.5))
         hp_annual_financial_saved = hp_annual_kwh_saved * avg_import_rate
         hp_payback_years = hp_install_cost / hp_annual_financial_saved if hp_annual_financial_saved > 0 else 99
@@ -887,6 +960,7 @@ if df_raw is not None and not df_raw.empty:
         st.info("💡 **Auditor Advice:** An investment payback below 10 years represents a strong utility offset investment, significantly compounding home equity valuation while buffering against rising grid import tariffs.")
 
     # ---------------------------------------------------------------------------
+    # TAB 5: SOLAR PV & SMART BATTERY DISPATCH
     # ---------------------------------------------------------------------------
     with tabs[4]:
         st.subheader("🔋 Solar PV & Smart Battery Dispatch Simulator")
@@ -900,11 +974,9 @@ if df_raw is not None and not df_raw.empty:
             roundtrip_efficiency = st.slider("Est. Roundtrip Battery Efficiency (%):", 70, 95, 85) / 100.0
             daily_cycles = st.selectbox("Dispatch Cycles per Day:", [1, 2], index=0)
             
-            # Smart tariff rate check
             night_rate = rates.get("night_rate", rates.get("flat_rate", 0.15))
             peak_rate = rates.get("peak_rate", rates.get("flat_rate", 0.35))
             
-            # Simple simulation: charge battery fully during Night Rate, discharge during Peak Rate (Peak Shaving)
             daily_arbitrage_profit = battery_capacity * (peak_rate - (night_rate / roundtrip_efficiency)) * daily_cycles
             monthly_profit = max(0.0, daily_arbitrage_profit * 30.4)
             annual_profit = monthly_profit * 12
@@ -917,21 +989,17 @@ if df_raw is not None and not df_raw.empty:
         with col_bat2:
             st.markdown("### 📈 Visualizing Daily Battery Arbitrage Cycles")
             
-            # Generate representative 24h battery charge/discharge curve
             hrs = np.linspace(0, 23.5, 48)
             battery_state = []
-            grid_imports_with_battery = []
             
-            # Define logic: charge 00:00-05:00, discharge 17:00-19:00
             for h in hrs:
                 if 0 <= h < 5:
-                    battery_state.append(battery_capacity * (h / 5.0)) # Charging
+                    battery_state.append(battery_capacity * (h / 5.0))
                 elif 17 <= h < 19:
-                    battery_state.append(battery_capacity * (1.0 - (h - 17.0) / 2.0)) # Discharging (Peak Shaving)
+                    battery_state.append(battery_capacity * (1.0 - (h - 17.0) / 2.0))
                 elif h >= 19:
-                    battery_state.append(0) # Depleted
+                    battery_state.append(0)
                 else:
-                    # Retaining charge or slow day discharge
                     battery_state.append(battery_capacity if h < 17 else 0)
                     
             fig_bat = go.Figure()
@@ -948,17 +1016,17 @@ if df_raw is not None and not df_raw.empty:
             )
             st.plotly_chart(fig_bat, use_container_width=True)
             
-            st.warning(f"⚠️ **Arbitrage Condition:** Charging at night (€{night_rate:.3f}/kWh) and discharging at peak (€{peak_rate:.3f}/kWh) yields a net cycle spread of **€{(peak_rate - (night_rate / roundtrip_efficiency)):.2f}/kWh** (taking into account {int((1-roundtrip_efficiency)*100)}% roundtrip efficiency thermal losses).")
+            st.warning(f"⚠️ **Arbitrage Condition:** Charging at night (€{night_rate:.3f}/kWh) and discharging at peak (€{peak_rate:.3f}/kWh) yields a net cycle spread of **€{(peak_rate - (night_rate / roundtrip_efficiency)):.2f}/kWh** (taking into account {int((1-roundtrip_efficiency)*100)}% roundtrip efficiency losses).")
 
     # ---------------------------------------------------------------------------
+    # TAB 6: PHANTOM HUNTER (STANDBY POWER)
     # ---------------------------------------------------------------------------
     with tabs[5]:
         st.subheader("🧛 Phantom Load Hunter (Standby Vampire Audit)")
         st.write("Vampire draw is the electricity consumed by appliances left plugged in or kept on active standby. Historically, these quiet draws account for **10-15% of total home electricity bills**.")
         
-        # Calculate calculated baseload continuous draw
         avg_vampire_kwh = df_filtered["app_always_on"].mean()
-        avg_vampire_watts = avg_vampire_kwh * 2.0 * 1000.0  # kwh per 30 mins converted to constant Watt draw
+        avg_vampire_watts = avg_vampire_kwh * 2.0 * 1000.0
         annual_vampire_cost = (df_filtered["app_always_on"].sum() * avg_import_rate) * (selected_month == "All Months" and 1 or 12)
         
         st.markdown(f"#### Your Audited Continuous Baseload: **{avg_vampire_watts:.1f} Watts** (Costing €{annual_vampire_cost:.2f}/year)")
@@ -967,14 +1035,13 @@ if df_raw is not None and not df_raw.empty:
         col_vamp1, col_vamp2 = st.columns(2)
         
         with col_vamp1:
-            kill_tv = st.checkbox("Living Room TV Console Standby (TV, Soundbar, Apple TV, Receiver) [-25W]", value=False)
+            kill_tv = st.checkbox("Living Room TV Console Standby (TV, Soundbar, Apple TV) [-25W]", value=False)
             kill_router = st.checkbox("Wi-Fi Router Overnight Eco-Mode Sleep (01:00 - 06:00) [-12W]", value=False)
-            kill_charging = st.checkbox("Standby Smart Chargers (Phones, Laptops, Vacuum Docks) [-8W]", value=False)
-            kill_desktop = st.checkbox("Home Office Setup Standby (Dual Monitors, Desktop PC sleep) [-35W]", value=False)
-            kill_microwave = st.checkbox("Kitchen Appliances Standby (Microwave, Oven, Coffee Clocks) [-10W]", value=False)
+            kill_charging = st.checkbox("Standby Smart Chargers (Phones, Laptops) [-8W]", value=False)
+            kill_desktop = st.checkbox("Home Office Setup Standby (Dual Monitors, Desktop PC) [-35W]", value=False)
+            kill_microwave = st.checkbox("Kitchen Appliances Standby (Microwave, Oven Clock) [-10W]", value=False)
             kill_consoles = st.checkbox("Gaming Console Quick-Resume Standby (PS5/Xbox) [-15W]", value=False)
             
-        # Calculate dynamic reduction
         eliminated_watts = 0.0
         if kill_tv: eliminated_watts += 25.0
         if kill_router: eliminated_watts += 12.0
@@ -983,8 +1050,6 @@ if df_raw is not None and not df_raw.empty:
         if kill_microwave: eliminated_watts += 10.0
         if kill_consoles: eliminated_watts += 15.0
         
-        # Conversion to annual € savings
-        # eliminated_watts * 24h * 365 days / 1000 * import_rate
         eliminated_annual_kwh = (eliminated_watts * 24.0 * 365.25) / 1000.0
         eliminated_annual_cash = eliminated_annual_kwh * avg_import_rate
         
@@ -993,20 +1058,19 @@ if df_raw is not None and not df_raw.empty:
             st.metric("Baseline Standby Power Cut", f"-{eliminated_watts:.1f} W", delta="Vampire Load Reduced")
             st.metric("Annualized Cost Recovered", f"€{eliminated_annual_cash:.2f}", delta="Direct Savings Pattern", delta_color="inverse")
             
-            # Progress meter to goal
             pct_vamp_eliminated = min(100.0, (eliminated_watts / max(1.0, avg_vampire_watts)) * 100.0)
             st.markdown(f"**Vampire Baseline Eradication Progress: {pct_vamp_eliminated:.1f}%**")
             st.progress(pct_vamp_eliminated / 100.0)
             
-            st.success("💡 **Action Actionable:** Plugging your television array and office desk into a single smart power strip on a timer can automate these savings, fully recouping the cost of the smart plug within weeks.")
+            st.success("💡 **Action Actionable:** Plugging your television array and office desk into a single smart power strip on a timer can automate these savings, fully recouping the cost within weeks.")
 
     # ---------------------------------------------------------------------------
+    # TAB 7: APPLIANCE DIAGNOSTICS
     # ---------------------------------------------------------------------------
     with tabs[6]:
         st.subheader("🩺 Appliance Wear & Seal Health Diagnostics")
         st.write("Electrical compressors (like those inside refrigerators, wine coolers, and heat pumps) decay over time. As rubber door seals wear down, cooling units must work significantly harder, changing their cyclic draw behavior.")
         
-        # Heuristic Analysis of background load stability
         min_vampire_draw = df_filtered["app_always_on"].min()
         max_vampire_draw = df_filtered["app_always_on"].max()
         draw_variance = max_vampire_draw - min_vampire_draw
@@ -1022,7 +1086,7 @@ if df_raw is not None and not df_raw.empty:
                 st.write("Your standby power shows wide baseline fluctuations. This often points to a refrigerator or freezer with leaking seals, forcing the compressor cycle to run continuously at a higher power stage.")
             else:
                 st.success("✅ **Continuous Loop Audit: Healthy Pattern**")
-                st.write("Your background baseline is tight and stable, indicating that cycling kitchen refrigeration units are holding their temperature charges efficiently without constant short-cycling.")
+                st.write("Your background baseline is tight and stable, indicating that cycling kitchen refrigeration units are holding their temperature charges efficiently.")
                 
             st.markdown("---")
             st.markdown("### 🛒 Appliance Upgrade ROI Tracker")
@@ -1031,7 +1095,6 @@ if df_raw is not None and not df_raw.empty:
             old_fridge_watts = st.slider("Aged Appliance Baseline Draw (Watts):", 50, 300, 150)
             replacement_cost = st.number_input("Cost of New Efficient Replacement (€):", value=499.0)
             
-            # Math: (old_fridge_watts - 20w) * 24 * 365 / 1000 = kwh saved
             annual_upgrade_kwh_saved = ((old_fridge_watts - 20) * 24.0 * 365.25) / 1000.0
             annual_upgrade_cash_saved = annual_upgrade_kwh_saved * avg_import_rate
             upgrade_payback_years = replacement_cost / annual_upgrade_cash_saved
@@ -1043,10 +1106,9 @@ if df_raw is not None and not df_raw.empty:
             st.markdown("### 🔍 Real-Time Compressor Cycle Anatomy")
             st.write("Healthy vs. Decaying refrigeration draw patterns:")
             
-            # Generate mock compressor cycling data
             time_axis = np.linspace(0, 12, 100)
             healthy_cycle = 0.05 + 0.10 * np.maximum(0, np.sin(time_axis * 2.5))
-            failing_cycle = 0.12 + 0.12 * np.maximum(0, np.sin(time_axis * 1.5) + 0.2) # runs longer, higher base
+            failing_cycle = 0.12 + 0.12 * np.maximum(0, np.sin(time_axis * 1.5) + 0.2)
             
             fig_cycle = go.Figure()
             fig_cycle.add_trace(go.Scatter(x=time_axis, y=healthy_cycle, mode='lines', name='Healthy Compressor Loop', line=dict(color='#2ecc71', width=2.5)))
@@ -1060,18 +1122,18 @@ if df_raw is not None and not df_raw.empty:
             st.plotly_chart(fig_cycle, use_container_width=True)
 
     # ---------------------------------------------------------------------------
+    # TAB 8: CHORE TASK MASTER
     # ---------------------------------------------------------------------------
     with tabs[7]:
         st.subheader("📅 Actionable Chore Task Master (Custom Savings Calendar)")
-        st.write("Other energy platforms display retrospective historical graphs. Below is your tailored operational task schedule, mapping out optimal operational windows to minimize cost spikes:")
+        st.write("Avoid cost spikes by organizing domestic chore routines around your localized tariff bands:")
         
-        # Define high-savings windows based on active rates
         if rates["type"] == "flat":
             st.info("💡 **Flat Tariff Notice:** Because you are on a flat 24h tariff, the cost of running appliances is identical at any hour of the day. If you switch to a **Smart Tariff**, you can unlock major savings by executing high-load tasks during night bands.")
             
             col_sc1, col_sc2 = st.columns(2)
             with col_sc1:
-                st.markdown("<div class='task-card task-green'><b>🏡 Optimal Chore Schedule: All Hours</b><br>Your flat pricing allows unrestricted use of high-energy equipment (Dishwasher, Dryer, EV Charger) with no pricing penalty.</div>", unsafe_allow_html=True)
+                st.markdown("<div class='task-card task-green'><b>🏡 Optimal Chore Schedule: All Hours</b><br>Your flat pricing allows unrestricted use of high-energy equipment with no pricing penalty.</div>", unsafe_allow_html=True)
             with col_sc2:
                 st.markdown("<div class='task-card task-orange'><b>💡 Smart Suggestion: Get Arbitrage</b><br>Consider switching to a Time-of-Use smart tariff. Moving heavy chore patterns to overnight schedules can reduce your bill by up to 35%.</div>", unsafe_allow_html=True)
         else:
@@ -1110,17 +1172,18 @@ if df_raw is not None and not df_raw.empty:
             with col_sc3:
                 st.markdown("### 🔴 Peak Premium (Avoid Heavy Chores)")
                 st.markdown(
-                    """
+                    f"""
                     <div class='task-card task-red'>
                         <b>⏰ 17:00 - 19:00 (Peak Premium Rate)</b><br>
-                        • <b>CRITICAL WARNING</b>: Tariff rate rises to <b>€{:.2f}/kWh</b>.<br>
+                        • <b>CRITICAL WARNING</b>: Tariff rate rises to <b>€{rates.get('peak_rate', 0.35):.2f}/kWh</b>.<br>
                         • Avoid: Dryer cycles, heavy electric heaters, cooker elements.<br>
                         • Recommendation: Shift laundry/charging to later night bands.
                     </div>
-                    """.format(rates["peak_rate"]), unsafe_allow_html=True
+                    """, unsafe_allow_html=True
                 )
 
     # ---------------------------------------------------------------------------
+    # TAB 9: ENERGY INTENSITY GRID
     # ---------------------------------------------------------------------------
     with tabs[8]:
         st.subheader("🔍 Energy Intensity Weekly Heat Grid")
