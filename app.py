@@ -380,14 +380,14 @@ def calculate_smart_projection(df_all: pd.DataFrame, target_month: str, rates: d
         projected_usage_cost = actual_usage_cost
         
     actual_standing_pso = days_elapsed * rates["daily_standing_charge"]
-    actual_gross_cost = (actual_usage_cost + actual_standing_pso) * (1 + rates["vat_rate"])
+    actual_gross_cost = actual_usage_cost + actual_standing_pso
     
     if is_unfinished:
         projected_standing_pso = days_in_month * rates["daily_standing_charge"]
     else:
         projected_standing_pso = days_elapsed * rates["daily_standing_charge"]
         
-    projected_gross_cost = (projected_usage_cost + projected_standing_pso) * (1 + rates["vat_rate"])
+    projected_gross_cost = projected_usage_cost + projected_standing_pso
     
     return actual_kwh, actual_gross_cost, projected_kwh, projected_gross_cost, is_unfinished, days_elapsed, days_in_month
 
@@ -503,12 +503,12 @@ def build_full_month_projection_timeline(df_all: pd.DataFrame, target_month: str
                 accumulated_kwh_projected += day_kwh
                 accumulated_cost_projected += day_cost
             
-        daily_standing_cost_inc_vat = rates["daily_standing_charge"] * (1 + rates["vat_rate"])
-        gross_actual_cost = (day_cost * (1 + rates["vat_rate"])) + daily_standing_cost_inc_vat if status == "Actual" else 0.0
-        gross_projected_cost = (day_cost * (1 + rates["vat_rate"])) + daily_standing_cost_inc_vat if status in ["Actual", "Projected (Target Month)", "Projected (Next Month)"] else 0.0
+        daily_standing_cost_inc_vat = rates["daily_standing_charge"]
+        gross_actual_cost = day_cost + daily_standing_cost_inc_vat if status == "Actual" else 0.0
+        gross_projected_cost = day_cost + daily_standing_cost_inc_vat if status in ["Actual", "Projected (Target Month)", "Projected (Next Month)"] else 0.0
         
-        gross_accumulated_actual_cost = (accumulated_cost_actual * (1 + rates["vat_rate"])) + (days_in_current_accum_month) * daily_standing_cost_inc_vat if status == "Actual" else np.nan
-        gross_accumulated_projected_cost = (accumulated_cost_projected * (1 + rates["vat_rate"])) + (days_in_current_accum_month) * daily_standing_cost_inc_vat
+        gross_accumulated_actual_cost = accumulated_cost_actual + (days_in_current_accum_month) * daily_standing_cost_inc_vat if status == "Actual" else np.nan
+        gross_accumulated_projected_cost = accumulated_cost_projected + (days_in_current_accum_month) * daily_standing_cost_inc_vat
         
         timeline_records.append({
             "Date": d,
@@ -554,18 +554,24 @@ with st.sidebar:
     rates = {}
     if tariff_style == "24-Hour Flat Tariff":
         rates["type"] = "flat"
-        rates["flat_rate"] = st.number_input("Flat Rate (Cent/kWh)", value=26.41) / 100.0
+        rates["flat_rate"] = st.number_input("24HR Unit Rate (Cent per kWh)", value=29.31) / 100.0
     else:
         rates["type"] = "smart"
-        rates["day_rate"] = st.number_input("Day Rate (Cent/kWh)", value=28.20) / 100.0
+        rates["day_rate"] = st.number_input("Day Rate (Cent/kWh)", value=29.31) / 100.0
         rates["night_rate"] = st.number_input("Night Rate (Cent/kWh)", value=15.10) / 100.0
         rates["peak_rate"] = st.number_input("Peak Rate (Cent/kWh)", value=35.40) / 100.0
 
-    with st.expander("Fixed Charges & Taxes", expanded=False):
-        annual_standing = st.number_input("Annual Standing Charge (€)", value=270.45)
-        annual_pso      = st.number_input("Annual PSO Levy (€)", value=19.10)
-        rates["vat_rate"] = st.number_input("VAT Rate (%)", value=9.0) / 100.0
+    with st.expander("Fixed Charges", expanded=False):
+        annual_standing = st.number_input("Standing Charge Annual - Urban (€)", value=300.20)
+        annual_pso      = st.number_input("PSO Levy (€)", value=19.10)
         rates["daily_standing_charge"] = (annual_standing + annual_pso) / 365.25
+
+    st.header("🔥 Gas Pricing")
+    gas_rates = {}
+    gas_rates["unit_rate"] = st.number_input("Gas Unit Rate (Cent per kWh)", value=9.14) / 100.0
+    gas_rates["annual_standing_charge"] = st.number_input("Gas Standing Charge Annual (€)", value=170.84)
+    gas_rates["annual_carbon_tax"] = st.number_input("Gas Carbon Tax Annual (€)", value=137.65)
+    gas_rates["daily_fixed_charge"] = (gas_rates["annual_standing_charge"] + gas_rates["annual_carbon_tax"]) / 365.25
 
     st.header("🔌 Household Profile")
     house_profile = {
@@ -634,11 +640,11 @@ if df_raw is not None and not df_raw.empty:
         kwh=("estimated_kwh", "sum"),
         cost=("cost", "sum")
     ).reset_index()
-    daily_stats["cost_inc_fixed_vat"] = (daily_stats["cost"] + rates["daily_standing_charge"]) * (1 + rates["vat_rate"])
+    daily_stats["cost_inc_fixed"] = daily_stats["cost"] + rates["daily_standing_charge"]
 
     if not daily_stats.empty:
-        lowest_daily_cost = daily_stats["cost_inc_fixed_vat"].quantile(0.10)
-        peak_daily_cost   = daily_stats["cost_inc_fixed_vat"].quantile(0.90)
+        lowest_daily_cost = daily_stats["cost_inc_fixed"].quantile(0.10)
+        peak_daily_cost   = daily_stats["cost_inc_fixed"].quantile(0.90)
     else:
         lowest_daily_cost = 0.0
         peak_daily_cost   = 0.0
@@ -661,7 +667,7 @@ if df_raw is not None and not df_raw.empty:
         color, val, label, sub = ("#4e342e", proj_kwh, "Estimated Period-End", f"Actual to-date: {actual_kwh:,.1f} kWh") if is_unfinished else ("#0d47a1", actual_kwh, "Total Consumption", "Completed Period")
         st.markdown(f'<div class="metric-container"><div class="metric-value" style="color:{color};">{val:,.1f} kWh</div><div class="metric-label">{label}</div><div class="metric-badge badge-actual">{sub}</div></div>', unsafe_allow_html=True)
     with col2:
-        color, val, label, sub = ("#4e342e", proj_cost, "Projected Period Bill", f"Actual to-date: €{actual_gross_cost:,.2f}") if is_unfinished else ("#1b5e20", actual_gross_cost, "Total Cost (Inc VAT)", "Completed Period")
+        color, val, label, sub = ("#4e342e", proj_cost, "Projected Period Bill", f"Actual to-date: €{actual_gross_cost:,.2f}") if is_unfinished else ("#1b5e20", actual_gross_cost, "Total Cost", "Completed Period")
         st.markdown(f'<div class="metric-container"><div class="metric-value" style="color:{color};">€{val:,.2f}</div><div class="metric-label">{label}</div><div class="metric-badge badge-success">{sub}</div></div>', unsafe_allow_html=True)
     with col3:
         st.markdown(f'<div class="metric-container"><div class="metric-value" style="color:#e65100;">€{(actual_gross_cost/max(days_elapsed,1)):.2f}/day</div><div class="metric-label">Avg Daily Cost</div><div class="metric-badge badge-warning">Target: < €{(actual_gross_cost*0.9/max(days_elapsed,1)):.2f}</div></div>', unsafe_allow_html=True)
@@ -679,7 +685,8 @@ if df_raw is not None and not df_raw.empty:
         "🧛 Phantom Hunter", 
         "🩺 Appliance Diagnostics", 
         "📅 Chore Task Master",
-        "🔍 Heat Density Grid"
+        "🔍 Heat Density Grid",
+        "🔥 Gas Overview"
     ]
     tabs = st.tabs(tab_list)
 
@@ -689,7 +696,7 @@ if df_raw is not None and not df_raw.empty:
     with tabs[0]:
         st.subheader("Monthly Historical Trends")
         monthly = df.groupby("year_month").agg(total_kwh=("estimated_kwh", "sum"), cost=("cost", "sum"), days=("date_only", "nunique")).reset_index()
-        monthly["total_cost"] = (monthly["cost"] + (monthly["days"] * rates["daily_standing_charge"])) * (1 + rates["vat_rate"])
+        monthly["total_cost"] = monthly["cost"] + (monthly["days"] * rates["daily_standing_charge"])
         
         c1, c2 = st.columns(2)
         with c1:
@@ -721,8 +728,8 @@ if df_raw is not None and not df_raw.empty:
         total_next_month_kwh = next_month_df["Daily Projected Trend (kWh)"].sum() if not next_month_df.empty else 0.0
         if not next_month_df.empty:
             next_month_days_count = len(next_month_df)
-            raw_usage_cost_next = next_month_df["Daily Projected Cost Trend (€)"].sum() - (next_month_days_count * rates["daily_standing_charge"] * (1 + rates["vat_rate"]))
-            total_next_month_cost = raw_usage_cost_next + (next_month_days_count * rates["daily_standing_charge"] * (1 + rates["vat_rate"]))
+            raw_usage_cost_next = next_month_df["Daily Projected Cost Trend (€)"].sum() - (next_month_days_count * rates["daily_standing_charge"])
+            total_next_month_cost = raw_usage_cost_next + (next_month_days_count * rates["daily_standing_charge"])
         else:
             total_next_month_cost = 0.0
 
@@ -808,7 +815,7 @@ if df_raw is not None and not df_raw.empty:
                 fig_cum.add_vline(x=sep_date, line_width=1.5, line_dash="dash", line_color="#b0bec5")
 
             fig_cum.update_layout(
-                title=f"Projective Cumulative Spend Climb (Inc. Standing Charges & VAT) - Resets at 1st of {next_month_name}",
+                title=f"Projective Cumulative Spend Climb (Standing Charges Included) - Resets at 1st of {next_month_name}",
                 xaxis_title="Date",
                 yaxis_title="Total Bill Accumulation (€)",
                 legend_orientation="h"
@@ -837,14 +844,14 @@ if df_raw is not None and not df_raw.empty:
             ]].copy()
             
             display_rem_df.columns = [
-                "Date", "Day Name", "Projected Daily Usage (kWh)", "Projected Daily Cost (Inc VAT + Standing) (€)", 
+                "Date", "Day Name", "Projected Daily Usage (kWh)", "Projected Daily Cost (Standing Included) (€)", 
                 "Cumulative Outlook (kWh)", "Cumulative Outlook (€)"
             ]
             
             st.dataframe(
                 display_rem_df.style.format({
                     "Projected Daily Usage (kWh)": "{:.2f}",
-                    "Projected Daily Cost (Inc VAT + Standing) (€)": "€{:.2f}",
+                    "Projected Daily Cost (Standing Included) (€)": "€{:.2f}",
                     "Cumulative Outlook (kWh)": "{:.2f}",
                     "Cumulative Outlook (€)": "€{:.2f}"
                 }),
@@ -1212,3 +1219,41 @@ if df_raw is not None and not df_raw.empty:
 
 else:
     st.info("👈 Upload your Smart Meter Data or select the Demo Data option to get started.")
+
+    # ---------------------------------------------------------------------------
+    # TAB 10: GAS OVERVIEW
+    # ---------------------------------------------------------------------------
+    with tabs[9]:
+        st.subheader("🔥 Gas Pricing Overview")
+        st.write("This tab tracks your default gas pricing inputs as VAT-inclusive values and gives quick annualised cost references.")
+
+        gas_col1, gas_col2, gas_col3 = st.columns(3)
+        with gas_col1:
+            st.metric("Gas Unit Rate", f"{gas_rates['unit_rate']*100:.2f} c/kWh")
+        with gas_col2:
+            st.metric("Standing Charge", f"€{gas_rates['annual_standing_charge']:.2f}/year")
+        with gas_col3:
+            st.metric("Carbon Tax", f"€{gas_rates['annual_carbon_tax']:.2f}/year")
+
+        st.markdown("---")
+        st.markdown("### Annual Gas Bill Estimator")
+        annual_gas_kwh = st.slider("Estimated Annual Gas Usage (kWh)", min_value=0, max_value=50000, value=12000, step=500)
+        annual_gas_usage_cost = annual_gas_kwh * gas_rates['unit_rate']
+        annual_gas_fixed_cost = gas_rates['annual_standing_charge'] + gas_rates['annual_carbon_tax']
+        annual_gas_total = annual_gas_usage_cost + annual_gas_fixed_cost
+
+        g1, g2, g3 = st.columns(3)
+        with g1:
+            st.metric("Estimated Usage Cost", f"€{annual_gas_usage_cost:,.2f}")
+        with g2:
+            st.metric("Fixed Charges", f"€{annual_gas_fixed_cost:,.2f}")
+        with g3:
+            st.metric("Estimated Annual Gas Bill", f"€{annual_gas_total:,.2f}")
+
+        monthly_gas_df = pd.DataFrame({
+            "Component": ["Usage", "Standing Charge", "Carbon Tax"],
+            "Amount": [annual_gas_usage_cost, gas_rates['annual_standing_charge'], gas_rates['annual_carbon_tax']]
+        })
+        fig_gas = px.bar(monthly_gas_df, x="Component", y="Amount", text="Amount", title="Annual Gas Cost Breakdown", color="Component")
+        fig_gas.update_traces(texttemplate="€%{y:,.0f}", textposition="outside")
+        st.plotly_chart(fig_gas, use_container_width=True)
